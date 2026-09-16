@@ -1,0 +1,159 @@
+/* ─── CSS Variables for instance colours (used by SVG strokes and table rows) ─ */
+:root {
+  --heading-color: #000000;
+  --attitude-color-instance: #000000;
+  --windAngle-color: #00838f;
+  --current-color: #0d47a1;
+  --currentDamped-color: #0d47a1;
+  --boatSpeed-color: #388e3c;
+  --boatSpeedDamped-color: #388e3c;
+  --correctedBoatSpeed-color: #27632a;
+  --boatSpeedRefGround-color: #00575b;
+  --groundSpeed-color: #5d4037;
+  --groundSpeedDamped-color: #5d4037;
+  --speedCorrection-color: #ad1457;
+  --residual-color: #6a1b9a;
+  --correctionTable-color: #4e342e;
+}
+
+/* ─── Instance ID colours ──────────────────────────────────────────────────── */
+#heading           { color: var(--heading-color);           stroke: var(--heading-color); }
+#attitude          { color: var(--attitude-color-instance); stroke: var(--attitude-color-instance); }
+#windAngle         { color: var(--windAngle-color);         stroke: var(--windAngle-color); }
+#current,
+#currentDamped     { color: var(--current-color);           stroke: var(--current-color); }
+#boatSpeed,
+#boatSpeedDamped   { color: var(--boatSpeed-color);         stroke: var(--boatSpeed-color); }
+#correctedBoatSpeed { color: var(--correctedBoatSpeed-color); stroke: var(--correctedBoatSpeed-color); }
+#boatSpeedRefGround { color: var(--boatSpeedRefGround-color); stroke: var(--boatSpeedRefGround-color); }
+#groundSpeed,
+#groundSpeedDamped { color: var(--groundSpeed-color);    stroke: var(--groundSpeed-color); }
+#speedCorrection   { color: var(--speedCorrection-color);   stroke: var(--speedCorrection-color); }
+#residual          { color: var(--residual-color);          stroke: var(--residual-color); }
+#correctionTable   { color: var(--correctionTable-color);   stroke: var(--correctionTable-color); }
+
+/* ─── Correction table sizing & layout ─────────────────────────────────────── */
+.Table2D {
+  border-collapse: collapse;
+}
+
+.TableCell {
+  width: 60px;
+  min-width: 60px;
+  height: 60px;
+  text-align: center;
+  vertical-align: middle;
+  font-size: 11px;
+}
+
+/* Header & Corner cells */
+.TablecolumnHeader {
+  min-width: 60px;
+  padding: 4px;
+  text-align: center;
+  font-size: 11px;
+}
+
+.TableRowHeader {
+  padding: 4px 8px;
+  text-align: right;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.TableCorner { 
+  font-size: 10px; 
+  color: #888; 
+  font-weight: 400; 
+  text-align: center;
+  padding: 4px 8px;
+}
+
+/* Cell states */
+.cell--empty     { background-color: #f0f0f0; }
+.cell--neighbour { box-shadow: inset 0 0 0 1px #90a4ae; }
+.cell-factor     { font-weight: 600; font-size: 12px; }
+.cell-leeway     { font-weight: 600; font-size: 12px; margin-top: 2px; }
+.cell--active .cell-factor,
+.cell--active .cell-leeway { color: #1565c0; }
+
+/* ─── Stable table column widths inside cards ──────────────────────────────── */
+.card-body .table {
+  table-layout: fixed;
+  width: 100%;
+}
+.card-body .table td:first-child {
+  width: 55%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.card-body .table td:first-child small {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  display: block;
+}
+.card-body .table td:last-child { width: 45%; }
+
+/* ─── SVG stroke rules ─────────────────────────────────────────────────────── */
+line { stroke-width: 2; }
+#hull, #mast { stroke: purple; stroke-width: 1; stroke-linecap: round; }
+
+/* ─── Surface plot ─────────────────────────────────────────────────────────── */
+.surfacePlot { width: 100%; height: 100%; border: 1px solid black; padding: 0; margin: 0; position: relative; }
+
+/* ─── SignalK navbar-brand suppression ─────────────────────────────────────── */
+.app-header .navbar-brand {
+  background-image: none !important;
+  width: auto !important;
+}
+.app-header .navbar-brand::before,
+.app-header .navbar-brand::after {
+  display: none !important;
+  content: none !important;
+}
+
+/* ─── App title ────────────────────────────────────────────────────────────── */
+.app-title {
+  font-size: 1.1rem;
+  font-weight: 500;
+  color: #29363D;
+}
+
+/* ─── Sidebar accent ───────────────────────────────────────────────────────── */
+.sidebar .nav-link.active { border-left-color: #00bcd4 !important; }
+
+/* ─── Stale data rows ──────────────────────────────────────────────────────── */
+tr.stale td { color: #aaa; font-style: italic; }
+
+/* ─── Correction table legend ─────────────────────────────────────────────── */
+.table-legend { display: flex; flex-direction: column; gap: 3px; }
+.table-legend-row { display: flex; align-items: center; gap: 6px; }
+.legend-swatch {
+  flex-shrink: 0;
+  width: 28px;
+  height: 16px;
+  border: 1px solid #ccc;
+  border-radius: 2px;
+  display: inline-block;
+}
+.legend-swatch--green    { background-color: rgb(0, 160, 80); }
+.legend-swatch--orange   { background-color: rgb(255, 165, 0); }
+.legend-swatch--stripe   {
+  background: repeating-linear-gradient(
+    120deg,
+    rgb(100, 180, 100) 0px, rgb(100, 180, 100) 4px,
+    #f0f0f0 4px, #f0f0f0 5px
+  );
+}
+.legend-swatch--active    { background: transparent; border: none; width: auto; height: auto; font-weight: 600; color: #1565c0; font-size: 11px; white-space: nowrap; }
+.legend-swatch--neighbour { background: #fff; box-shadow: inset 0 0 0 1px #90a4ae; }
+.legend-label-wide        { flex-shrink: 0; white-space: nowrap; font-weight: 600; }
+
+/* Enable horizontal scroll on wide correction tables */
+#table-container {
+  overflow-x: auto;
+  max-width: 100%;
+  display: block;
+}
