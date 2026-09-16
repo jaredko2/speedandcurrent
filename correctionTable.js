@@ -1,11 +1,10 @@
-const { Table2D} = require('signalkutilities');
+const { Table2D } = require('signalkutilities');
 const { KalmanFilter, State } = require('kalman-filter');
 
-// Module-level helpers — avoids creating new Function objects on every Kalman update call
 function _rotateValue(cos, sin, vector) {
   return [
-     cos * vector[0] + sin * vector[1],
-    -sin * vector[0] + cos * vector[1]
+    cos * vector[0] + sin * vector[1],
+   -sin * vector[0] + cos * vector[1]
   ];
 }
 
@@ -16,32 +15,13 @@ function _rotateVariance(cos, sin, vector) {
   ];
 }
 
-class CorrectionTable extends Table2D{
-  /**
-   * Represents a 2D correction table for heel and speed.
-   */
-
-
-
+class CorrectionTable extends Table2D {
   static fromJSON(data, stability) {
     const table = new CorrectionTable(data.id, data.row, data.col, stability);
     table.table = data.table.map(row => row.map(cellData => CorrectionEstimator.fromJSON(cellData, stability)));
     return table;
   }
 
-  /**
-   * Resample an existing table onto a new grid conservatively.
-   * - Seeds mean from oldTable.getCorrection at each new cell center
-   * - Seeds diagonal covariance with a per-axis floor
-   * - Sets index (N) = 0 so all cells can re-learn on the new grid
-   *
-   * @param {CorrectionTable} oldTable - Source table to sample from
-   * @param {{min:number,max:number,step:number}} newRow - New speed axis definition (SI units)
-   * @param {{min:number,max:number,step:number}} newCol - New heel axis definition (SI units)
-   * @param {number} [stability=5] - Stability passed to new table filter model
-   * @param {number} [varianceFloor=1e-4] - Floor applied to cov[0][0] and cov[1][1]
-   * @returns {CorrectionTable}
-   */
   static resample(oldTable, newRow, newCol, stability = 5, varianceFloor = 1e-4) {
     const newTable = new CorrectionTable(oldTable.id, newRow, newCol, stability);
 
@@ -51,19 +31,18 @@ class CorrectionTable extends Table2D{
     for (let i = 0; i < nRows; i++) {
       const speed = newRow.min + i * newRow.step;
       for (let j = 0; j < nCols; j++) {
-        const heel = newCol.min + j * newCol.step;
+        const dim2 = newCol.min + j * newCol.step;
 
-        const { correction, variance } = oldTable.getCorrection(speed, heel);
+        const { correction, variance } = oldTable.getCorrection(speed, dim2);
 
         const mean = [[(correction?.x ?? 0)], [(correction?.y ?? 0)]];
         const covXX = Math.max(Number.isFinite(variance?.x) ? variance.x : 0, varianceFloor);
         const covYY = Math.max(Number.isFinite(variance?.y) ? variance.y : 0, varianceFloor);
         const covariance = [[covXX, 0], [0, covYY]];
 
-        // Decide initialization index based on coverage/support from old table
         const inBounds = (
           speed >= oldTable.min[0] && speed <= oldTable.max[0] &&
-          heel  >= oldTable.min[1] && heel  <= oldTable.max[1]
+          dim2  >= oldTable.min[1] && dim2  <= oldTable.max[1]
         );
         let supportCount = 0;
         let effectiveN = 0;
@@ -75,20 +54,16 @@ class CorrectionTable extends Table2D{
             effectiveN += w * N;
           }
         }
-        // Heuristic: require in-bounds AND at least 2 learned neighbours AND some effective support
         const index = (inBounds && supportCount >= 2 && effectiveN >= 1) ? 1 : 0;
-
-        // Seed prior with mean and conservative covariance; index as decided above
-        newTable.table[i][j].filterState = new State({ mean, covariance, index });
+        if (newTable.table[i] && newTable.table[i][j]) {
+          newTable.table[i][j].filterState = new State({ mean, covariance, index });
+        }
       }
     }
     newTable.setDisplayAttributes({ label: "correction table" });
     return newTable;
   }
 
-  /**
-   * Convenience to resample from serialized JSON table data
-   */
   static resampleFromJSON(data, newRow, newCol, stability = 5, varianceFloor = 1e-4) {
     const oldTable = CorrectionTable.fromJSON(data, stability);
     return CorrectionTable.resample(oldTable, newRow, newCol, stability, varianceFloor);
@@ -101,17 +76,34 @@ class CorrectionTable extends Table2D{
     this.neighbours = [];
   }
   
-  update(speed, heel, groundSpeed, current, boatSpeed, heading) {
-    const cell = this.getCell(speed, heel);
-    const accepted = cell?.update(groundSpeed, current, boatSpeed, heading);
+  getCell(rowVal, colVal) {
+    if (!this.table || this.table.length === 0) return null;
+    let rIdx = Math.floor((rowVal - this.min[0]) / this.step[0]);
+    let cIdx = Math.floor((colVal - this.min[1]) / this.step[1]);
+
+    // Array Index Clamping
+    rIdx = Math.max(0, Math.min(rIdx, this.table.length - 1));
+    const targetRow = this.table[rIdx] || [];
+    cIdx = Math.max(0, Math.min(cIdx, targetRow.length - 1));
+
+    return targetRow[cIdx] || null;
+  }
+
+  update(speed, dim2Val, groundSpeed, current, boatSpeed, heading) {
+    const cell = this.getCell(speed, dim2Val);
+    if (!cell) {
+      this.lastUpdateResult = 'rejected';
+      return;
+    }
+    const accepted = cell.update(groundSpeed, current, boatSpeed, heading);
     this.lastUpdatedCell = cell;
     this.lastUpdateResult = accepted === true ? 'accepted' : 'rejected';
   }
 
-  getCorrection(speed, heel) {
-    this.neighbours = this.findClosest(speed, heel, 5);
-    if (this.neighbours.length == 0) return { correction: {x: 0, y: 0}, variance: null };
-    // Compute the correction and variance from the neighbours
+  getCorrection(speed, dim2Val) {
+    this.neighbours = this.findClosest(speed, dim2Val, 5);
+    if (this.neighbours.length === 0) return { correction: {x: 0, y: 0}, variance: null };
+
     let x = 0;
     let y = 0;
     let varX = 0;
@@ -119,13 +111,15 @@ class CorrectionTable extends Table2D{
     let totalWeight = 0;
     for (const neighbour of this.neighbours) {
       const { cell:correction, dist } = neighbour;
-      if (correction.N > 0) {
+      if (correction && correction.N > 0) {
         const weight = 1 / (dist + 1e-6); 
         neighbour.normWeight = weight;
         x += correction.x * weight;
         y += correction.y * weight;
-        varX += correction.covariance[0][0] * weight ** 2;
-        varY += correction.covariance[1][1] * weight ** 2;
+        if (correction.covariance) {
+          varX += correction.covariance[0][0] * weight ** 2;
+          varY += correction.covariance[1][1] * weight ** 2;
+        }
         totalWeight += weight;
       }
     }
@@ -137,8 +131,6 @@ class CorrectionTable extends Table2D{
 
     if (totalWeight === 0) return { correction: { x: 0, y: 0 }, variance: { x: 0, y: 0 } };
 
-    // Compute the final correction and variance
-    // Variance of a weighted mean: Σ(w²·var_i) / (Σw)²
     const tw2 = totalWeight * totalWeight;
     x /= totalWeight;
     y /= totalWeight;
@@ -154,19 +146,14 @@ class CorrectionTable extends Table2D{
       id: this.id,
       row: { min: this.min[0], max: this.max[0], step: this.step[0] },
       col: { min: this.min[1], max: this.max[1], step: this.step[1] },
-      table: this.table.map((row, rowIndex) =>
-        row.map((correction, colIndex) => {
+      table: (this.table || []).map((row, rowIndex) =>
+        (row || []).map((correction, colIndex) => {
           const cellReport = correction.report();
-          // Derive the bin coordinates from indices
-          const speedBin = this.min[0] + this.step[0] * rowIndex; // row axis represents speed
-          const heelBin = this.min[1] + this.step[1] * colIndex; // col axis represents heel
-          // Compute forward speed after longitudinal correction
+          const speedBin = this.min[0] + this.step[0] * rowIndex;
+          const dim2Bin = this.min[1] + this.step[1] * colIndex;
           const forward = speedBin + cellReport.x;
-          // Factor (forward relative to original speed); guard division by zero
           const factor = speedBin > 0 ? forward / speedBin : null;
-          // Leeway angle based on sideways over forward; only if forward > 0
           const leeway = (forward > 0 && cellReport.N > 0) ? Math.atan2(cellReport.y, forward) : null;
-          // Trace ( cov_xx + cov_yy ) when covariance available and N>0
           let trace = null;
           if (cellReport.N > 0) {
             const cov = correction.covariance;
@@ -179,8 +166,7 @@ class CorrectionTable extends Table2D{
           cellReport.leeway = leeway;
           cellReport.trace = trace;
           cellReport.speedBin = speedBin;
-          cellReport.heelBin = heelBin;
-          // Mark selected if this is the last updated cell
+          cellReport.heelBin = dim2Bin;
           cellReport.displayAttributes = {
             selected: correction === this.lastUpdatedCell
           };
@@ -197,14 +183,9 @@ class CorrectionTable extends Table2D{
       lastUpdateResult: this.lastUpdateResult ?? null
     };
   }
-
 }
 
 class CorrectionEstimator {
-  /**
-   * Represents a Kalman correction at a cell in a correction table
-   */
-
   static fromJSON(data, stability) {
     const filterModel = CorrectionEstimator.getFilterModel(stability);
     const estimator = new CorrectionEstimator(filterModel, data.state);
@@ -214,13 +195,13 @@ class CorrectionEstimator {
   static getFilterModel(stability = 5) {
     return {
       observation: {
-        stateProjection: [[1, 0], [0, 1]], // observation matrix H
-        covariance: [[1, 0], [0, 1]], //measurement noise R
+        stateProjection: [[1, 0], [0, 1]],
+        covariance: [[1, 0], [0, 1]],
         dimension: 2
       },
       dynamic: {
-        transition: [[1, 0], [0, 1]], // state transition matrix F
-        covariance: [1/10**stability, 1/10**stability],// process noise covariance matrix Q
+        transition: [[1, 0], [0, 1]],
+        covariance: [1/10**stability, 1/10**stability],
       }
     };
   }
@@ -234,12 +215,12 @@ class CorrectionEstimator {
   }
   
   update(groundSpeed, current, boatSpeed, heading) {
-    if(groundSpeed.xVariance == null || groundSpeed.yVariance == null ||
-       current.xVariance == null || current.yVariance == null ||
-       boatSpeed.xVariance == null || boatSpeed.yVariance == null ) {
+    if (!groundSpeed || !current || !boatSpeed ||
+        groundSpeed.xVariance == null || groundSpeed.yVariance == null ||
+        current.xVariance == null || current.yVariance == null ||
+        boatSpeed.xVariance == null || boatSpeed.yVariance == null) {
        return false;
     }
-    // Rotation matrix for -theta
     const cosTheta = Math.cos(heading);
     const sinTheta = Math.sin(heading);
 
@@ -263,13 +244,8 @@ class CorrectionEstimator {
       groundCov[1][0] + currentCov[1][0] + boatCov[1][0],
       groundCov[1][1] + currentCov[1][1] + boatCov[1][1]],
     ];
-    // Mahalanobis distance check.
-    // For empty cells (filterState === null) we use a diffuse prior — mean (0,0),
-    // variance DIFFUSE_PRIOR_VAR — expressing "assume no correction needed, but
-    // with high uncertainty".  This gates the very first observation instead of
-    // accepting it unconditionally, preventing a single outlier from locking a
-    // cell at a bad value.
-    const DIFFUSE_PRIOR_VAR = 1.0; // (m/s)² — rejects corrections > ~3 m/s from zero
+
+    const DIFFUSE_PRIOR_VAR = 1.0;
     const priorMean = this.filterState !== null
       ? [this.filterState.mean[0][0], this.filterState.mean[1][0]]
       : [0, 0];
@@ -297,7 +273,6 @@ class CorrectionEstimator {
     return true;
   }
 
-
   report() {
     return { x: this.x, y: this.y, N: this.N };
   }
@@ -318,15 +293,12 @@ class CorrectionEstimator {
   }
 
   get covariance() {
-    return this.filterState.covariance;
+    return this.filterState ? this.filterState.covariance : null;
   }
-
 
   toJSON() {
-    return this.N != 0 ? { state: this.filterState } : { state: null };
+    return this.N !== 0 ? { state: this.filterState } : { state: null };
   }
-
 }
-
 
 module.exports = { CorrectionTable };

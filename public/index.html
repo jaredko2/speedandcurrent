@@ -169,7 +169,6 @@
 
         <!-- ===== CORRECTION TABLE SECTION ===== -->
         <div id="section-table" class="app-section" style="display:none">
-
           <div class="card">
             <div class="card-header" style="position:relative">
               <span class="fw-bold text-uppercase">Correction Table</span>
@@ -193,7 +192,7 @@
                 </div>
                 <div class="table-legend-row">
                   <span class="legend-swatch legend-swatch--stripe"></span>
-                  <span><strong>Stripe angle</strong> — encodes leeway direction; stripes are tilted proportionally to the leeway correction (°)</span>
+                  <span><strong>Stripe angle</strong> — encodes leeway direction; stripes are tilted proportionally to leeway (°)</span>
                 </div>
                 <div class="table-legend-row">
                   <span class="legend-swatch legend-swatch--active">+1.2%</span>
@@ -201,11 +200,7 @@
                 </div>
                 <div class="table-legend-row">
                   <span class="legend-swatch legend-swatch--neighbour"></span>
-                  <span><strong>Faint tint</strong> — interpolation neighbours used in the current estimate</span>
-                </div>
-                <div class="table-legend-row mt-1">
-                  <span class="legend-label-wide">Cell values:</span>
-                  <span>top = speed-correction factor (±%), bottom = leeway correction (±°)</span>
+                  <span><strong>Faint tint</strong> — interpolation neighbours used in current estimate</span>
                 </div>
               </div>
               <div id="table-container"></div>
@@ -243,9 +238,7 @@
     });
   </script>
 
-  <!-- ===== TABLE MANAGER MODALS ===== -->
-
-  <!-- Create table -->
+  <!-- Create table modal -->
   <div class="modal fade" id="modal-create" tabindex="-1" role="dialog">
     <div class="modal-dialog" role="document">
       <div class="modal-content">
@@ -259,8 +252,8 @@
               <tr><td>Name</td><td><input type="text" id="create-name" class="form-control form-control-sm" placeholder="e.g. table-2026" style="width:180px"></td></tr>
               <tr><td id="create-maxSpeed-label">Max speed (kn)</td><td><input type="number" id="create-maxSpeed" class="form-control form-control-sm" value="9" min="1" max="30" step="1" style="width:80px"></td></tr>
               <tr><td id="create-speedStep-label">Speed step (kn)</td><td><input type="number" id="create-speedStep" class="form-control form-control-sm" value="1" min="0.1" max="5" step="0.1" style="width:80px"></td></tr>
-              <tr><td id="create-maxHeel-label">Max heel (&deg;)</td><td><input type="number" id="create-maxHeel" class="form-control form-control-sm" value="32" min="1" max="90" step="1" style="width:80px"></td></tr>
-              <tr><td id="create-heelStep-label">Heel step (&deg;)</td><td><input type="number" id="create-heelStep" class="form-control form-control-sm" value="8" min="1" max="30" step="1" style="width:80px"></td></tr>
+              <tr><td id="create-maxDim2-label">Max angle (&deg;)</td><td><input type="number" id="create-maxDim2" class="form-control form-control-sm" value="180" min="1" max="180" step="1" style="width:80px"></td></tr>
+              <tr><td id="create-dim2Step-label">Angle step (&deg;)</td><td><input type="number" id="create-dim2Step" class="form-control form-control-sm" value="15" min="1" max="45" step="1" style="width:80px"></td></tr>
             </tbody>
           </table>
         </div>
@@ -273,7 +266,7 @@
     </div>
   </div>
 
-  <!-- Load table -->
+  <!-- Load table modal -->
   <div class="modal fade" id="modal-load" tabindex="-1" role="dialog">
     <div class="modal-dialog" role="document">
       <div class="modal-content">
@@ -294,7 +287,7 @@
     </div>
   </div>
 
-  <!-- Copy table -->
+  <!-- Copy table modal -->
   <div class="modal fade" id="modal-copy" tabindex="-1" role="dialog">
     <div class="modal-dialog" role="document">
       <div class="modal-content">
@@ -303,7 +296,6 @@
           <button type="button" class="close" data-dismiss="modal"><span>&times;</span></button>
         </div>
         <div class="modal-body">
-          <p class="text-muted small">Save the active table under a new name and activate it.</p>
           <table class="table table-sm table-borderless">
             <tbody>
               <tr><td>New name</td><td><input type="text" id="copy-name" class="form-control form-control-sm" placeholder="e.g. backup-2026" style="width:180px"></td></tr>
@@ -319,7 +311,7 @@
     </div>
   </div>
 
-  <!-- Resize table -->
+  <!-- Resize table modal -->
   <div class="modal fade" id="modal-resize" tabindex="-1" role="dialog">
     <div class="modal-dialog" role="document">
       <div class="modal-content">
@@ -328,13 +320,12 @@
           <button type="button" class="close" data-dismiss="modal"><span>&times;</span></button>
         </div>
         <div class="modal-body">
-          <p class="text-muted small">Resamples learned corrections onto a new grid. The active table file is overwritten.</p>
           <table class="table table-sm table-borderless">
             <tbody>
               <tr><td id="resize-maxSpeed-label">Max speed (kn)</td><td><input type="number" id="resize-maxSpeed" class="form-control form-control-sm" min="1" max="30" step="1" style="width:80px"></td></tr>
               <tr><td id="resize-speedStep-label">Speed step (kn)</td><td><input type="number" id="resize-speedStep" class="form-control form-control-sm" min="0.1" max="5" step="0.1" style="width:80px"></td></tr>
-              <tr><td id="resize-maxHeel-label">Max heel (&deg;)</td><td><input type="number" id="resize-maxHeel" class="form-control form-control-sm" min="1" max="90" step="1" style="width:80px"></td></tr>
-              <tr><td id="resize-heelStep-label">Heel step (&deg;)</td><td><input type="number" id="resize-heelStep" class="form-control form-control-sm" min="1" max="30" step="1" style="width:80px"></td></tr>
+              <tr><td id="resize-maxDim2-label">Max angle (&deg;)</td><td><input type="number" id="resize-maxDim2" class="form-control form-control-sm" min="1" max="180" step="1" style="width:80px"></td></tr>
+              <tr><td id="resize-dim2Step-label">Angle step (&deg;)</td><td><input type="number" id="resize-dim2Step" class="form-control form-control-sm" min="1" max="45" step="1" style="width:80px"></td></tr>
             </tbody>
           </table>
         </div>

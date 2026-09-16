@@ -2,6 +2,7 @@
 :root {
   --heading-color: #000000;
   --attitude-color-instance: #000000;
+  --windAngle-color: #00838f;
   --current-color: #0d47a1;
   --currentDamped-color: #0d47a1;
   --boatSpeed-color: #388e3c;
@@ -16,31 +17,59 @@
 }
 
 /* ─── Instance ID colours ──────────────────────────────────────────────────── */
-#heading          { color: var(--heading-color);          stroke: var(--heading-color); }
-#attitude         { color: var(--attitude-color-instance);stroke: var(--attitude-color-instance); }
+#heading           { color: var(--heading-color);           stroke: var(--heading-color); }
+#attitude          { color: var(--attitude-color-instance); stroke: var(--attitude-color-instance); }
+#windAngle         { color: var(--windAngle-color);         stroke: var(--windAngle-color); }
 #current,
-#currentDamped    { color: var(--current-color);          stroke: var(--current-color); }
+#currentDamped     { color: var(--current-color);           stroke: var(--current-color); }
 #boatSpeed,
-#boatSpeedDamped  { color: var(--boatSpeed-color);        stroke: var(--boatSpeed-color); }
+#boatSpeedDamped   { color: var(--boatSpeed-color);         stroke: var(--boatSpeed-color); }
 #correctedBoatSpeed { color: var(--correctedBoatSpeed-color); stroke: var(--correctedBoatSpeed-color); }
 #boatSpeedRefGround { color: var(--boatSpeedRefGround-color); stroke: var(--boatSpeedRefGround-color); }
 #groundSpeed,
 #groundSpeedDamped { color: var(--groundSpeed-color);    stroke: var(--groundSpeed-color); }
-#speedCorrection  { color: var(--speedCorrection-color);  stroke: var(--speedCorrection-color); }
-#residual         { color: var(--residual-color);          stroke: var(--residual-color); }
-#correctionTable  { color: var(--correctionTable-color);  stroke: var(--correctionTable-color); }
+#speedCorrection   { color: var(--speedCorrection-color);   stroke: var(--speedCorrection-color); }
+#residual          { color: var(--residual-color);          stroke: var(--residual-color); }
+#correctionTable   { color: var(--correctionTable-color);   stroke: var(--correctionTable-color); }
 
-/* ─── Correction table cell sizing ────────────────────────────────────────── */
+/* ─── Correction table sizing & layout ─────────────────────────────────────── */
+.Table2D {
+  border-collapse: collapse;
+}
+
 .TableCell {
   width: 60px;
+  min-width: 60px;
   height: 60px;
   text-align: center;
   vertical-align: middle;
   font-size: 11px;
 }
-/* corner cell: show axis units */
-.TableCorner { font-size: 10px; color: #888; font-weight: 400; text-align: center; }
-/* cell states */
+
+/* Header & Corner cells */
+.TablecolumnHeader {
+  min-width: 60px;
+  padding: 4px;
+  text-align: center;
+  font-size: 11px;
+}
+
+.TableRowHeader {
+  padding: 4px 8px;
+  text-align: right;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.TableCorner { 
+  font-size: 10px; 
+  color: #888; 
+  font-weight: 400; 
+  text-align: center;
+  padding: 4px 8px;
+}
+
+/* Cell states */
 .cell--empty     { background-color: #f0f0f0; }
 .cell--neighbour { box-shadow: inset 0 0 0 1px #90a4ae; }
 .cell-factor     { font-weight: 600; font-size: 12px; }
@@ -118,6 +147,12 @@ tr.stale td { color: #aaa; font-style: italic; }
     #f0f0f0 4px, #f0f0f0 5px
   );
 }
-.legend-swatch--active   { background: transparent; border: none; width: auto; height: auto; font-weight: 600; color: #1565c0; font-size: 11px; white-space: nowrap; }
+.legend-swatch--active    { background: transparent; border: none; width: auto; height: auto; font-weight: 600; color: #1565c0; font-size: 11px; white-space: nowrap; }
 .legend-swatch--neighbour { background: #fff; box-shadow: inset 0 0 0 1px #90a4ae; }
-.legend-label-wide       { flex-shrink: 0; white-space: nowrap; font-weight: 600; }
+.legend-label-wide        { flex-shrink: 0; white-space: nowrap; font-weight: 600; }
+/* Enable horizontal scroll on wide correction tables */
+#table-container {
+  overflow-x: auto;
+  max-width: 100%;
+  display: block;
+}
