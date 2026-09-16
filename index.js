@@ -158,6 +158,7 @@ module.exports = function (app) {
     stability: 7,
     assumeCurrent: false,
     suspendLearningOnNavigationState: false,
+    tableDimension: 'heel',
     tableName: 'correctionTable',
     configVersion: 2,
     smootherClass: 'MovingAverageSmoother',
@@ -167,12 +168,9 @@ module.exports = function (app) {
     showStatistics: false
   };
 
-  
-
   function readOptions() {
     const stored = app.readPluginOptions();
     const raw = stored && stored.configuration ? stored.configuration : (stored || {});
-    // Strip embedded table — stored separately on disk
     const { correctionTable: _drop, ...rest } = raw;
     options = { ...defaultOptions, ...rest };
   }
@@ -188,10 +186,6 @@ module.exports = function (app) {
     saveOptions();
   }
 
-  /**
-   * Strips obsolete source-selection fields from the persisted config and
-   * writes it back if anything changed. Called once on every start().
-   */
   function migrateConfig() {
     const obsoleteKeys = ['headingSource', 'boatSpeedSource', 'SOGSource', 'attitudeSource', 'preventDuplication', 'minSogForLearning'];
     const hadObsolete = obsoleteKeys.some(k => k in options);
@@ -203,14 +197,6 @@ module.exports = function (app) {
     }
   }
 
-  /**
-   * Derives { SmootherClass, smootherOptions } from the current options.
-   * Enforces minimums so the smoother always has at least two observations for
-   * variance to be meaningful:
-   *   - MovingAverageSmoother: timeSpan >= 2 s  (≥ 2 samples at typical 1 Hz)
-   *   - ExponentialSmoother:   tau        >= 1 s
-   *   - KalmanSmoother:        steadyState in [0.01, 0.99]
-   */
   function resolveSmootherConfig() {
     const cls = options.smootherClass || 'MovingAverageSmoother';
     if (cls === 'ExponentialSmoother') {
@@ -226,7 +212,6 @@ module.exports = function (app) {
         smootherOptions: { steadyState: K }
       };
     }
-    // Default: MovingAverageSmoother
     return {
       SmootherClass: MovingAverageSmoother,
       smootherOptions: { timeSpan: Math.max(2, Number(options.smootherTimeSpan) || 5) }
@@ -237,13 +222,14 @@ module.exports = function (app) {
     table = newTable;
     minSpeed = table.step[0];
     if (reportFull) reportFull.setTables([table]);
-    lastSave = Date.now(); // explicit table operations already save; defer next periodic save
+    lastSave = Date.now();
   }
 
   let isRunning = false;
   let pluginStatus = 'Stopped';
   let smoothedHeading = null;
   let smoothedAttitude = null;
+  let smoothedWindAngle = null;
   let rawCurrent = null;
   let smoothedCurrent = null;
   let smoothedBoatSpeed = null;
@@ -259,6 +245,7 @@ module.exports = function (app) {
 
   let rawHeading = null;
   let rawAttitude = null;
+  let rawWindAngle = null;
   let noCurrent = null;
   let rawBoatSpeed = null;
   let rawGroundSpeed = null;
@@ -319,7 +306,8 @@ module.exports = function (app) {
       observationReason: observation.reason,
       minStwForLearning: minSpeed,
       minSogForLearning: minSpeed,
-      navigationState
+      navigationState,
+      tableDimension: options.tableDimension || 'heel'
     };
   }
 
@@ -382,10 +370,9 @@ module.exports = function (app) {
     properties: {}
   };
 
-
   plugin.registerWithRouter = function (router) {
     app.debug('registerWithRouter');
-    readOptions(); // pre-load so /api/settings works before start()
+    readOptions();
 
     router.get('/api/report', (req, res) => {
       if (!isRunning) {
@@ -406,13 +393,10 @@ module.exports = function (app) {
       }
     });
 
-
-
     router.get('/api/status', (req, res) => {
       res.json({ status: pluginStatus, isRunning, lifecycleWarnings, learningState: getLearningStatePayload() });
     });
 
-    // --- Settings API ---
     router.get('/api/settings', (req, res) => {
       res.json({ ...options, ...changedOptions });
     });
@@ -422,7 +406,6 @@ module.exports = function (app) {
       if (!body || typeof body !== 'object') {
         return res.status(400).json({ error: 'JSON body required' });
       }
-      // Reject keys managed by the table manager
       const blocked = ['correctionTable', 'tableName'];
       for (const k of blocked) {
         if (k in body) {
@@ -433,9 +416,6 @@ module.exports = function (app) {
       res.json({ ...options, ...changedOptions });
     });
 
-    // --- Correction Table Manager API ---
-
-    // List all table files in dataDir
     router.get('/api/tables', (req, res) => {
       const dataDir = app.getDataDirPath();
       let files;
@@ -455,7 +435,6 @@ module.exports = function (app) {
       res.json(tables);
     });
 
-    // Create a new table and hot-swap it
     router.post('/api/tables/create', (req, res) => {
       const body = req.body || {};
       const name = (body.name || '').trim();
@@ -469,14 +448,13 @@ module.exports = function (app) {
       const row = { min: 0, max: body.maxSpeed, step: body.speedStep };
       const col = { min: -body.maxHeel, max: body.maxHeel, step: body.heelStep };
       const newTable = new CorrectionTable(name, row, col, options.stability || 7);
-      newTable.setDisplayAttributes({ label: name }); // Table2D API unchanged
+      newTable.setDisplayAttributes({ label: name });
       saveTable(newTable, path.join(app.getDataDirPath(), name + '.json'));
       if (isRunning) swapTable(newTable);
       saveTableName(name);
       res.json({ name });
     });
 
-    // Load a saved table and make it active
     router.post('/api/tables/load', (req, res) => {
       const body = req.body || {};
       const name = (body.name || '').trim();
@@ -486,13 +464,12 @@ module.exports = function (app) {
       const fileData = Table2D.readFromFile(filePath);
       if (!fileData) return res.status(404).json({ error: `Table '${name}' not found` });
       const loadedTable = CorrectionTable.fromJSON(fileData, options.stability || 7);
-      loadedTable.setDisplayAttributes({ label: name }); // Table2D API unchanged
+      loadedTable.setDisplayAttributes({ label: name });
       if (isRunning) swapTable(loadedTable);
       saveTableName(name);
       res.json({ name });
     });
 
-    // Copy active table under a new name and hot-swap to it
     router.post('/api/tables/copy', (req, res) => {
       if (!isRunning || !table) return res.status(503).json({ error: 'Plugin is not running' });
       const body = req.body || {};
@@ -502,14 +479,13 @@ module.exports = function (app) {
       const data = table.toJSON();
       data.id = newName;
       const copiedTable = CorrectionTable.fromJSON(data, options.stability || 7);
-      copiedTable.setDisplayAttributes({ label: newName }); // Table2D API unchanged
+      copiedTable.setDisplayAttributes({ label: newName });
       saveTable(copiedTable, path.join(app.getDataDirPath(), newName + '.json'));
       swapTable(copiedTable);
       saveTableName(newName);
       res.json({ name: newName });
     });
 
-    // Resize the active table (resamples onto new grid, preserves name)
     router.post('/api/tables/resize', (req, res) => {
       if (!isRunning || !table) return res.status(503).json({ error: 'Plugin is not running' });
       const body = req.body || {};
@@ -521,13 +497,13 @@ module.exports = function (app) {
       const newRow = { min: 0, max: body.maxSpeed, step: body.speedStep };
       const newCol = { min: -body.maxHeel, max: body.maxHeel, step: body.heelStep };
       const resized = CorrectionTable.resampleFromJSON(table.toJSON(), newRow, newCol, options.stability || 7, 1e-4);
-      resized.setDisplayAttributes({ label: resized.id }); // Table2D API unchanged
+      resized.setDisplayAttributes({ label: resized.id });
       saveTable(resized, path.join(app.getDataDirPath(), resized.id + '.json'));
       swapTable(resized);
       res.json({ name: resized.id });
     });
 
-  }
+  };
 
   function setStatus(msg) {
     pluginStatus = msg;
@@ -539,17 +515,15 @@ module.exports = function (app) {
     app.debug("Starting");
     lifecycleWarningMap = new Map();
     lifecycleWarnings = [];
-    readOptions(); // pick up any saves since registerWithRouter ran
-    migrateConfig(); // strip obsolete fields from persisted config
+    readOptions();
+    migrateConfig();
     const tableName = options.tableName || 'correctionTable';
     const tableFilePath = path.join(app.getDataDirPath(), tableName + '.json');
     table = loadTable(options, tableFilePath);
     minSpeed = table.step[0];
 
-    //#region Handler and Polar Initialization
     const { SmootherClass, smootherOptions } = resolveSmootherConfig();
 
-    // heading
     smoothedHeading = new SmoothedAngle(app, plugin.id, 'heading', 'navigation.headingTrue', {
       angleRange: '0to2pi',
       meta: { displayName: 'Heading', plane: 'Ground' },
@@ -563,7 +537,6 @@ module.exports = function (app) {
     });
     rawHeading = smoothedHeading.handler;
 
-    // attitude
     smoothedAttitude = createSmoothedHandler({
       app, pluginId: plugin.id,
       id: 'attitude',
@@ -579,6 +552,19 @@ module.exports = function (app) {
     });
     rawAttitude = smoothedAttitude.handler;
 
+    smoothedWindAngle = new SmoothedAngle(app, plugin.id, 'windAngleApparent', 'environment.wind.angleApparent', {
+      angleRange: '-piToPi',
+      meta: { displayName: 'Apparent wind angle', plane: 'Boat' },
+      SmootherClass,
+      smootherOptions,
+      ...buildLifecycleCallbacks(
+        'windAngleApparent.angle',
+        () => smoothedWindAngle?.handler?.path || 'environment.wind.angleApparent',
+        () => { smoothedWindAngle?.unsubscribe(); smoothedWindAngle?.subscribe(false, true); }
+      )
+    });
+    rawWindAngle = smoothedWindAngle.handler;
+
     navigationStateHandler = new MessageHandler(app, plugin.id, 'navigationState');
     navigationStateHandler.configure('navigation.state');
     navigationStateHandler.onDelta = () => {
@@ -586,9 +572,6 @@ module.exports = function (app) {
     };
     navigationStateHandler.subscribe();
 
-
-    // current
-    // send metadata for current
     MessageHandler.setMeta(app, plugin.id, "environment.current.drift", {units: "m/s", type: "number", description: "Speed of the current"});
     MessageHandler.setMeta(app, plugin.id, "environment.current.setTrue", { units: "rad", type: "number", description: "Direction of the current" });
     rawCurrent = new Polar(app, plugin.id, "current");
@@ -596,14 +579,11 @@ module.exports = function (app) {
     rawCurrent.configureAngle("environment.current.setTrue");
     rawCurrent.setMeta({ displayName: "Current", plane: "Ground" });
     rawCurrent.setAngleRange('0to2pi');
-    smoothedCurrent = new PolarSmoother(rawCurrent, KalmanSmoother, { processVariance: 0.000001, measurementVariance: 0.01 }); // id auto-derived: 'current.smoothed'
+    smoothedCurrent = new PolarSmoother(rawCurrent, KalmanSmoother, { processVariance: 0.000001, measurementVariance: 0.01 });
     smoothedCurrent.setAngleRange('0to2pi');
-    // Current should be initialised as no current
     rawCurrent.setVectorValue({ x: 0, y: 0 });
-    // Strongly assume no current at start
     smoothedCurrent.xSmoother.reset(0, 0.00000001);
     smoothedCurrent.ySmoother.reset(0, 0.00000001);
-    // no current
     noCurrent = createSmoothedPolar({
       id: "noCurrent",
       pathMagnitude: "environment.current.drift",
@@ -627,7 +607,6 @@ module.exports = function (app) {
       }
     });
 
-    // boatspeed
     smoothedBoatSpeed = createSmoothedHandler({
       app, pluginId: plugin.id,
       id: 'boatSpeed',
@@ -637,7 +616,6 @@ module.exports = function (app) {
       smootherOptions,
       onDelta: () => {
         clearLifecycleWarning('boatSpeed.smoothed');
-        // Drain any pending option changes before calculating
         if (Object.keys(changedOptions).length) applyOptionChanges();
 
         const learningMode = evaluateLearningMode({
@@ -661,8 +639,7 @@ module.exports = function (app) {
             lastSave = now;
           }
         }
-      }
-      ,
+      },
       onIdle: () => {
         if (!isRunning) return;
         const path = smoothedBoatSpeed?.handler?.path || 'navigation.speedThroughWater';
@@ -680,25 +657,20 @@ module.exports = function (app) {
     });
     rawBoatSpeed = smoothedBoatSpeed.handler;
 
-    // Learning polar — used for updating the correction table
     lrnBoatSpeed = new Polar(app, plugin.id, "lrnBoatSpeed");
     lrnBoatSpeed.configureMagnitude("navigation.speedThroughWater");
     lrnBoatSpeed.configureAngle("navigation.leewayAngle");
     lrnBoatSpeed.setMeta({ displayName: "Learning boat speed", plane: "Boat" });
     lrnBoatSpeed.setAngleRange('-piToPi');
 
-    
-    // corrected boatspeed holds both corrected boatspeed and estimated leeway
     correctedBoatSpeed = new Polar(app, plugin.id, "correctedBoatSpeed");
     correctedBoatSpeed.configureMagnitude("navigation.speedThroughWater");
     correctedBoatSpeed.configureAngle("navigation.leewayAngle");
     correctedBoatSpeed.setMeta({ displayName: "Corrected boatspeed / Leeway", plane: "Boat" });
-    
-    // boatspeed vector in ground frame, used for current estimation and residual calculation
+
     boatSpeedRefGround = new Polar(app, plugin.id, "boatSpeedRefGround");
     boatSpeedRefGround.setMeta({ displayName: "Boat speed over ground", plane: "Ground" });
 
-    // ground speed
     smoothedGroundSpeed = createSmoothedPolar({
       app, pluginId: plugin.id,
       id: 'groundSpeed',
@@ -716,21 +688,15 @@ module.exports = function (app) {
     });
     rawGroundSpeed = smoothedGroundSpeed.polar;
 
-    // correction vector
     speedCorrection = new Polar(app, plugin.id, "speedCorrection");
     speedCorrection.setMeta({ displayName: "Speed correction", plane: "Boat" });
 
-    // residual
     residual = new Polar(app, plugin.id, "residual");
     residual.setMeta({ displayName: "Residual", plane: "Ground" });
-    smoothedResidual = new PolarSmoother(residual, ExponentialSmoother, { tau: 30, timeSpan: 30 }); // id auto-derived: 'residual.smoothed'
+    smoothedResidual = new PolarSmoother(residual, ExponentialSmoother, { tau: 30, timeSpan: 30 });
     smoothedResidual.setAngleRange('0to2pi');
 
-    //#endregion
-
-    //#region Reporting
     reportFull = new Reporter();
-
     if (options.estimateBoatSpeed) {
       reportFull.addDelta(rawHeading);
       reportFull.addAttitude(rawAttitude);
@@ -743,21 +709,17 @@ module.exports = function (app) {
       reportFull.addPolar(residual);
       reportFull.addPolar(smoothedResidual);
     }
-    // Smoothed learning inputs are always subscribed regardless of updateCorrectionTable,
-    // so always add them to the report — otherwise warnings never clear when
-    // learning was disabled at startup and later toggled on.
     reportFull.addDelta(smoothedHeading);
     reportFull.addAttitude(smoothedAttitude);
+    if (options.tableDimension === 'windApparent') {
+      reportFull.addDelta(smoothedWindAngle);
+    }
     reportFull.addDelta(smoothedBoatSpeed);
     reportFull.addPolar(smoothedGroundSpeed);
-    // smoothedCurrent is already added by the estimateBoatSpeed block when that is on;
-    // only add it here when estimateBoatSpeed is off, to avoid a duplicate entry.
     if (options.assumeCurrent && !options.estimateBoatSpeed) {
       reportFull.addPolar(smoothedCurrent);
     }
     reportFull.addTable(table);
-
-    //#endregion
 
     isRunning = true;
     lastSave = 0;
@@ -768,7 +730,7 @@ module.exports = function (app) {
     setStatus('Running');
     app.debug("Running");
 
-  }
+  };
 
   plugin.stop = () => {
     return new Promise((resolve, reject) => {
@@ -776,11 +738,11 @@ module.exports = function (app) {
         if (table && !isTableEmpty(table)) {
           saveTableSync(table, path.join(app.getDataDirPath(), table.id + '.json'));
         }
-        // Clear all active output paths from the SK bus before teardown.
         if (smoothedCurrent) PolarSmoother.clear(app, plugin.id, [smoothedCurrent]);
         if (options.estimateBoatSpeed && correctedBoatSpeed) Polar.clear(app, plugin.id, [correctedBoatSpeed]);
         smoothedHeading = smoothedHeading?.terminate();
         smoothedAttitude = smoothedAttitude?.terminate();
+        smoothedWindAngle = smoothedWindAngle?.terminate();
         rawCurrent = rawCurrent?.terminate();
         smoothedCurrent = smoothedCurrent?.terminate?.();
         navigationStateHandler = navigationStateHandler?.terminate();
@@ -796,6 +758,7 @@ module.exports = function (app) {
         table = null;
         rawHeading = null;
         rawAttitude = null;
+        rawWindAngle = null;
         noCurrent = null;
         rawBoatSpeed = null;
         rawGroundSpeed = null;
@@ -818,32 +781,20 @@ module.exports = function (app) {
     });
   };
 
-  /**
-   * Corrects and publishes boat speed. Handles SOG fallback and missing-input
-   * silent fallback so that navigation.speedThroughWater is always written
-   * when estimateBoatSpeed is on, as long as any usable speed source exists.
-   *
-   * Priority order:
-   *   1. STW zero + sogFallback enabled + SOG available → publish SOG magnitude
-   *   2. attitude/heading not ready → publish raw STW unchanged (silent fallback)
-   *   3. All inputs ready → apply table correction; estimate current if wellUnderway
-   *
-   * @param {boolean} wellUnderway - Gates current estimation (requires 60 s settling).
-   */
   function correct(wellUnderway) {
-    // copy the boatspeed delta to polar
-    correctedBoatSpeed.setVectorValue({ x: rawBoatSpeed.value, y: 0 }); 
-    
+    correctedBoatSpeed.setVectorValue({ x: rawBoatSpeed.value, y: 0 });
     speedCorrection.setVectorValue({ x: 0, y: 0 });
 
-    // Priority 1: SOG fallback when STW is stuck at zero
-    // (onChange only fires when STW is ready, so a missing STW cannot reach here)
+    const useWindDimension = options.tableDimension === 'windApparent';
+    const dimensionReady = useWindDimension ? rawWindAngle?.ready : rawAttitude?.ready;
+    const dimensionValue = useWindDimension ? rawWindAngle?.value : rawAttitude?.value?.roll;
+
     if (options.sogFallback && rawGroundSpeed.ready && rawBoatSpeed.ready && rawBoatSpeed.value === 0 && rawGroundSpeed.magnitude >= minSpeed) {
         correctedBoatSpeed.setVectorValue({ x: rawGroundSpeed.magnitude, y: 0 });
     }
-    else if (rawAttitude.ready) {
+    else if (dimensionReady) {
       if (correctedBoatSpeed.magnitude > 0) {
-        const { correction, variance } = table.getCorrection(correctedBoatSpeed.magnitude, rawAttitude.value?.roll);
+        const { correction, variance } = table.getCorrection(correctedBoatSpeed.magnitude, dimensionValue);
         const leewayValid = isLeewayValid(correctedBoatSpeed.magnitude, minSpeed, navigationStateHandler);
         speedCorrection.setVectorValue(
           { x: correction.x, y: leewayValid ? correction.y : 0 },
@@ -851,24 +802,19 @@ module.exports = function (app) {
         );
         correctedBoatSpeed.add(speedCorrection);
       }
-      // Current estimation and residual also require heading (to rotate into ground frame).
-      // Also handle near-zero SOG where COG is unavailable: treat groundspeed as zero vector.
       const nearZeroGroundSpeed = isCogOverrideActive(rawGroundSpeed, minSpeed);
       if (rawHeading.ready && (rawGroundSpeed.ready || nearZeroGroundSpeed)) {
         boatSpeedRefGround.copyFrom(correctedBoatSpeed);
         boatSpeedRefGround.rotate(rawHeading.value);
-        // Current estimation gated by wellUnderway (smoothers need to settle first)
         if (wellUnderway) {
           if (rawGroundSpeed.ready) {
             rawCurrent.copyFrom(rawGroundSpeed);
           } else {
-            // COG unavailable but SOG is near-zero: boat is stationary, groundspeed treated as zero
             rawCurrent.setVectorValue({ x: 0, y: 0 });
           }
           rawCurrent.substract(boatSpeedRefGround);
           smoothedCurrent.sample();
         }
-        // Residual requires full groundspeed (both SOG and COG)
         if (rawGroundSpeed.ready) {
           residual.copyFrom(rawGroundSpeed);
           residual.substract(boatSpeedRefGround);
@@ -877,18 +823,11 @@ module.exports = function (app) {
         }
       }
     }
-    // Implicit fallback: attitude not ready — correctedBoatSpeed = raw STW, no correction
 
     PolarSmoother.send(app, plugin.id, [smoothedCurrent, smoothedResidual]);
-
     Polar.send(app, plugin.id, [correctedBoatSpeed]);
   }
 
-  /**
-   * Updates the correction table from the current smoothed inputs.
-   * Reads assumeCurrent and minSpeed from module-level options/state;
-   * silently returns if any required input is not yet ready.
-   */
   function updateTable() {
     lrnBoatSpeed.setVectorValue({ x: smoothedBoatSpeed.value, y: 0 }, { x: smoothedBoatSpeed.variance ?? 0, y: 0 });
     const learningMode = evaluateLearningMode({
@@ -902,7 +841,10 @@ module.exports = function (app) {
       learningMode.state = 'suspended';
       learningMode.reason = 'cog_override';
     }
-    const inputsReady = smoothedAttitude.ready && smoothedBoatSpeed.ready && smoothedHeading.ready && smoothedGroundSpeed.ready;
+    const useWindDimension = options.tableDimension === 'windApparent';
+    const dimensionReady = useWindDimension ? smoothedWindAngle.ready : smoothedAttitude.ready;
+    const dimensionValue = useWindDimension ? smoothedWindAngle.value : smoothedAttitude.value?.roll;
+    const inputsReady = smoothedBoatSpeed.ready && smoothedHeading.ready && smoothedGroundSpeed.ready && dimensionReady;
     const currentReady = !options.assumeCurrent || smoothedCurrent.ready;
     const observationGate = evaluateObservationGate({
       learningMode,
@@ -921,7 +863,7 @@ module.exports = function (app) {
       return;
     }
 
-    table.update(smoothedBoatSpeed.value, smoothedAttitude.value?.roll, smoothedGroundSpeed, options.assumeCurrent ? smoothedCurrent : noCurrent, lrnBoatSpeed, smoothedHeading.value);
+    table.update(smoothedBoatSpeed.value, dimensionValue, smoothedGroundSpeed, options.assumeCurrent ? smoothedCurrent : noCurrent, lrnBoatSpeed, smoothedHeading.value);
     if (table.lastUpdateResult === 'accepted') {
       setObservationStatus('accepted', 'accepted');
     } else if (table.lastUpdateResult === 'rejected') {
@@ -930,15 +872,6 @@ module.exports = function (app) {
     }
   }
 
-  /**
-   * Loads or creates a correction table from disk.
-   * If the file exists it is deserialized; otherwise a new table is created
-   * with default dimensions and saved to disk.
-   *
-   * @param {Object} options - Plugin options (stability, tableName, and dimension defaults).
-   * @param {string} filePath - Absolute path of the JSON file to read.
-   * @returns {CorrectionTable} The loaded or newly created CorrectionTable instance.
-   */
   function loadTable(options, filePath) {
     const stability = (options.stability !== undefined) ? options.stability : 6;
     let fileData = Table2D.readFromFile(filePath);
@@ -947,7 +880,6 @@ module.exports = function (app) {
       table = CorrectionTable.fromJSON(fileData, stability);
       app.debug("Correction table loaded: " + (fileData.id || filePath));
     } else if (fs.existsSync(filePath)) {
-      // File is present but could not be read — transient lock or parse error. Retry once.
       app.error(`Correction table file exists but could not be read, retrying: ${filePath}`);
       fileData = Table2D.readFromFile(filePath);
       if (fileData) {
@@ -967,25 +899,14 @@ module.exports = function (app) {
       table = new CorrectionTable(name, row, col, stability);
       app.debug("Correction table created: " + name);
     }
-    table.setDisplayAttributes({ label: table.id }); // Table2D API unchanged
+    table.setDisplayAttributes({ label: table.id });
     return table;
   }
 
-  /**
-   * Saves the correction table to disk as JSON (async, via library).
-   *
-   * @param {CorrectionTable} correctionTable - The correction table instance to save.
-   * @param {string} filePath - Absolute path of the target JSON file.
-   */
   function saveTable(correctionTable, filePath) {
     correctionTable.saveToFile(filePath);
   }
 
-  /**
-   * Saves the correction table synchronously. Used in stop() and when learning
-   * is toggled off, to ensure the write completes before the process can exit
-   * or the plugin be restarted.
-   */
   function saveTableSync(correctionTable, filePath) {
     try {
       const data = JSON.stringify(correctionTable.toJSON(), null, 2);
@@ -995,18 +916,10 @@ module.exports = function (app) {
     }
   }
 
-  /**
-   * Returns true if every cell in the table has N === 0 (no learned data).
-   * Used to guard against overwriting a good on-disk file with an empty table.
-   */
   function isTableEmpty(correctionTable) {
     return correctionTable.table.every(row => row.every(cell => cell.N === 0));
   }
 
-  /**
-   * Drains changedOptions into options and hot-applies each change where possible.
-   * Flag changes take effect immediately since onChange reads from options.* directly.
-   */
   function applyOptionChanges() {
     const changedKeys = Object.keys(changedOptions);
     for (const key of changedKeys) {
@@ -1015,12 +928,9 @@ module.exports = function (app) {
 
       if (key === 'updateCorrectionTable') {
         if (!value && table && !isTableEmpty(table)) {
-          // Learning switched off — persist current state before periodic saves stop
           saveTableSync(table, path.join(app.getDataDirPath(), table.id + '.json'));
           app.debug('Correction table saved: learning switched off');
         } else if (value && table && isTableEmpty(table)) {
-          // Learning switched on and in-memory table is empty — reload from disk
-          // to recover from a failed load at startup
           const filePath = path.join(app.getDataDirPath(), table.id + '.json');
           const fileData = Table2D.readFromFile(filePath);
           if (fileData) {
@@ -1033,9 +943,6 @@ module.exports = function (app) {
           }
         }
       }
-      // All other keys (sogFallback, estimateBoatSpeed, assumeCurrent,
-      // stability, smootherClass, etc.) are read
-      // directly from options.* so no extra action needed.
       if (key === 'estimateBoatSpeed' && !value && correctedBoatSpeed) {
         Polar.clear(app, plugin.id, [correctedBoatSpeed]);
         PolarSmoother.clear(app, plugin.id, [smoothedCurrent]);
@@ -1044,8 +951,6 @@ module.exports = function (app) {
       delete changedOptions[key];
     }
 
-    // Hot-apply smoother class / parameter changes to all user-tuned smoothers.
-    // (noCurrent and smoothedCurrent keep their own fixed Kalman settings.)
     const SMOOTHER_KEYS = ['smootherClass', 'smootherTau', 'smootherTimeSpan', 'smootherSteadyState'];
     if (changedKeys.some(k => SMOOTHER_KEYS.includes(k))) {
       const { SmootherClass: SC, smootherOptions: so } = resolveSmootherConfig();
@@ -1053,6 +958,7 @@ module.exports = function (app) {
         if (s) { s.setSmootherClass(SC); s.setSmootherOptions(so); }
       }
       if (smoothedAttitude) { smoothedAttitude.setSmootherClass(SC); smoothedAttitude.setSmootherOptions(so); }
+      if (smoothedWindAngle) { smoothedWindAngle.setSmootherClass(SC); smoothedWindAngle.setSmootherOptions(so); }
     }
     saveOptions();
   }
