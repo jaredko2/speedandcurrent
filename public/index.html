@@ -193,7 +193,7 @@
                 </div>
                 <div class="table-legend-row">
                   <span class="legend-swatch legend-swatch--stripe"></span>
-                  <span><strong>Stripe angle</strong> — encodes leeway direction; stripes are tilted proportionally to the leeway correction (°)</span>
+                  <span><strong>Stripe angle</strong> — encodes leeway direction; stripes are tilted proportionally to the leeway correction (&deg;)</span>
                 </div>
                 <div class="table-legend-row">
                   <span class="legend-swatch legend-swatch--active">+1.2%</span>
@@ -205,7 +205,7 @@
                 </div>
                 <div class="table-legend-row mt-1">
                   <span class="legend-label-wide">Cell values:</span>
-                  <span>top = speed-correction factor (±%), bottom = leeway correction (±°)</span>
+                  <span>top = speed-correction factor (&plusmn;%), bottom = leeway correction (&plusmn;&deg;)</span>
                 </div>
               </div>
               <div id="table-container"></div>
@@ -257,10 +257,19 @@
           <table class="table table-sm table-borderless">
             <tbody>
               <tr><td>Name</td><td><input type="text" id="create-name" class="form-control form-control-sm" placeholder="e.g. table-2026" style="width:180px"></td></tr>
+              <tr>
+                <td>2nd Dimension Mode</td>
+                <td>
+                  <select id="create-mode" class="form-select form-select-sm" style="width:180px">
+                    <option value="twa" selected>TWA (True Wind Angle)</option>
+                    <option value="heel">Heel Angle (Roll)</option>
+                  </select>
+                </td>
+              </tr>
               <tr><td id="create-maxSpeed-label">Max speed (kn)</td><td><input type="number" id="create-maxSpeed" class="form-control form-control-sm" value="9" min="1" max="30" step="1" style="width:80px"></td></tr>
               <tr><td id="create-speedStep-label">Speed step (kn)</td><td><input type="number" id="create-speedStep" class="form-control form-control-sm" value="1" min="0.1" max="5" step="0.1" style="width:80px"></td></tr>
-              <tr><td id="create-maxHeel-label">Max heel (&deg;)</td><td><input type="number" id="create-maxHeel" class="form-control form-control-sm" value="32" min="1" max="90" step="1" style="width:80px"></td></tr>
-              <tr><td id="create-heelStep-label">Heel step (&deg;)</td><td><input type="number" id="create-heelStep" class="form-control form-control-sm" value="8" min="1" max="30" step="1" style="width:80px"></td></tr>
+              <tr id="row-create-maxDim2" style="display:none"><td id="create-maxHeel-label">Max heel (&deg;)</td><td><input type="number" id="create-maxHeel" class="form-control form-control-sm" value="32" min="1" max="90" step="1" style="width:80px"></td></tr>
+              <tr id="row-create-dim2Step" style="display:none"><td id="create-heelStep-label">Heel step (&deg;)</td><td><input type="number" id="create-heelStep" class="form-control form-control-sm" value="8" min="1" max="30" step="1" style="width:80px"></td></tr>
             </tbody>
           </table>
         </div>

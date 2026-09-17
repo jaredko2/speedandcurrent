@@ -1,26 +1,19 @@
-﻿import TableRenderer from './TableRenderer.js';
+import TableRenderer from './TableRenderer.js';
 
 const API_BASE = '/plugins/speedandcurrent';
 
-// ─── Unit conversion (respects SK server unitPreferences via displayUnits in meta) ─
-// Fallback defaults are nautical (knots / degrees) when the server does not
-// supply displayUnits (old server or no unit-preference preset configured).
+// ─── Unit conversion ──────────────────────────────────────────────────────────
 const DEFAULTS = {
   speed: { convert: v => v * 1.943844, invert: v => v / 1.943844, symbol: 'kn', decimals: 1 },
   angle: { convert: v => v * (180 / Math.PI), invert: v => v * (Math.PI / 180), symbol: '°', decimals: 0 },
 };
 
-// Cache compiled converters so new Function() is called at most once per formula.
 const _converterCache = new Map();
 
-// Validate a formula string before passing it to Function().
-// Allows only numbers, whitespace, basic math operators, parens, and 'value'.
 function isSafeFormula(f) {
   return typeof f === 'string' && /^[\d\s+\-*/.()eE]*$/.test(f.replace(/\bvalue\b/g, '0'));
 }
 
-// Build a { convert, symbol, decimals } converter from a displayUnits object.
-// Returns null when displayUnits is absent, unsafe, or uncompilable.
 function buildConverter(displayUnits) {
   if (!displayUnits || !isSafeFormula(displayUnits.formula)) return null;
   const key = displayUnits.formula + '|' + (displayUnits.symbol || '') + '|' + (displayUnits.displayFormat || '');
@@ -31,7 +24,7 @@ function buildConverter(displayUnits) {
   let invertFn = null;
   if (isSafeFormula(displayUnits.inverseFormula)) {
     try { invertFn = new Function('value', 'return ' + displayUnits.inverseFormula); invertFn(1); }
-    catch (e) { /* leave null — will fall back to DEFAULTS.invert */ }
+    catch (e) { }
   }
   const parts = (displayUnits.displayFormat || '0.0').split('.');
   const decimals = parts.length > 1 ? parts[1].length : 0;
@@ -40,22 +33,15 @@ function buildConverter(displayUnits) {
   return result;
 }
 
-// Global converters extracted from meta after loadMeta(); used for attitudes and
-// table axes that don't have per-item displayUnits.
-// speed axis = speed through water; heel axis = attitude roll.
-// These are sourced from the specific items that define the table dimensions.
 const unitConverters = { speed: null, angle: null };
 
 function updateUnitConverters() {
-  // Speed axis: source from the STW polar (smoothed preferred, raw fallback)
   const speedMeta = metaById['boatSpeed.smoothed'] || metaById['boatSpeed'];
   unitConverters.speed = buildConverter(speedMeta?.magnitude?.displayUnits) || null;
-  // Heel axis: source from the attitude handler (smoothed preferred, raw fallback)
   const heelMeta = metaById['attitude.smoothed'] || metaById['attitude'];
   unitConverters.angle = buildConverter(heelMeta?.displayUnits) || null;
 }
 
-// Update dialog label text to reflect the active unit symbols.
 function applyUnitLabels() {
   const speedSym = (unitConverters.speed || DEFAULTS.speed).symbol;
   const angleSym = (unitConverters.angle || DEFAULTS.angle).symbol;
@@ -71,7 +57,7 @@ function applyUnitLabels() {
 // ─── TableRenderer instance ───────────────────────────────────────────────────
 const tableRenderer = new TableRenderer();
 
-// ─── Live state (indexed + raw arrays) ───────────────────────────────────────
+// ─── Live state ───────────────────────────────────────────────────────────────
 let state = {
   polarsAll: [], deltasAll: [], attitudesAll: [],
   polarsById: {}, deltasById: {}, attitudesById: {},
@@ -79,8 +65,6 @@ let state = {
 };
 
 function normaliseState(data) {
-  // reporter.report() returns { polars: {[id]:item}, deltas: {[id]:item},
-  //                             tables: {[id]:item}, attitudes: {[id]:item} }
   const polarsById    = {};
   const deltasById    = {};
   const attitudesById = {};
@@ -95,15 +79,13 @@ function normaliseState(data) {
   state = { polarsAll, deltasAll, attitudesAll, polarsById, deltasById, attitudesById, tablesById };
 }
 
-// ─── Static meta (fetched once at startup from /api/meta) ─────────────────────
-let metaById = {}; // keyed by item id
+// ─── Static meta ─────────────────────────────────────────────────────────────
+let metaById = {};
 let lifecycleWarnings = [];
 
 async function loadMeta() {
   const data = await apiGet('/api/meta');
   if (!data) return;
-  // reporter.meta() returns { polars: {[id]:meta}, deltas: {[id]:meta}, ... }
-  // Flatten into a single metaById lookup.
   metaById = {};
   for (const category of ['polars', 'deltas', 'attitudes', 'tables']) {
     const bucket = data[category] || {};
@@ -111,15 +93,8 @@ async function loadMeta() {
       metaById[id] = { ...m, id };
     }
   }
-  // Extract global speed/angle converters from the meta for attitudes and table axes.
   updateUnitConverters();
-  // Update dialog labels to reflect the active unit symbols.
   applyUnitLabels();
-}
-
-function isStale(item) {
-  if (!item) return true;
-  return item.state?.isStale === true;
 }
 
 function isNotReady(item) {
@@ -127,11 +102,6 @@ function isNotReady(item) {
   return item.state?.ready !== true;
 }
 
-// Returns a human-readable reason why an item is not ready.
-// Handles three state shapes:
-//   handler-nested  (MessageSmoother, SmoothedAngle):  state.handler.*
-//   magnitude/angle (PolarSmoother):                   state.magnitude.* / state.angle.*
-//   flat top-level  (MessageHandler, Polar):           state.*
 function getNotReadyReason(item) {
   if (!item) return 'not available';
   const s = item.state;
@@ -161,29 +131,7 @@ function getAnyItem(id) {
   return state.polarsById[id] || state.deltasById[id] || state.attitudesById[id] || null;
 }
 
-function renderWarnings(elId, ids) {
-  const el = document.getElementById(elId);
-  if (!el) return;
-  el.innerHTML = '';
-  const notReady = ids.filter(id => isNotReady(getAnyItem(id)));
-  if (notReady.length === 0) return;
-  const h = document.createElement('h6');
-  h.className = 'text-uppercase fw-bold text-muted border-bottom pb-1 mt-3 mb-1 small';
-  h.textContent = 'Warnings';
-  el.appendChild(h);
-  const ul = document.createElement('ul');
-  ul.className = 'list-unstyled text-danger small ps-3';
-  notReady.forEach(id => {
-    const item = getAnyItem(id);
-    const label = metaById[id]?.displayName ?? id;
-    const li = document.createElement('li');
-    li.textContent = `"${label}" — ${getNotReadyReason(item)}`;
-    ul.appendChild(li);
-  });
-  el.appendChild(ul);
-}
-
-function renderInputWarnings(elId, ids) {
+function renderInputWarnings(elId) {
   const el = document.getElementById(elId);
   if (!el) return;
   el.innerHTML = '';
@@ -206,10 +154,9 @@ function renderInputWarnings(elId, ids) {
   el.appendChild(ul);
 }
 
-// ─── Config (live settings mirror) ───────────────────────────────────────────
+// ─── Config ───────────────────────────────────────────────────────────────────
 let config = null;
 
-// ─── HTTP helpers ─────────────────────────────────────────────────────────────
 async function apiGet(path) {
   let res;
   try {
@@ -230,7 +177,6 @@ async function apiGet(path) {
   return res.json();
 }
 
-// PUT /api/settings: server returns full merged config — store it and re-render.
 async function apiPutSettings(body) {
   const res = await fetch(`${API_BASE}/api/settings`, {
     method: 'PUT', credentials: 'same-origin',
@@ -258,7 +204,7 @@ async function apiPost(path, body) {
   return res.json();
 }
 
-function showMessage(html, isLink = false) {
+function showMessage(html) {
   _explicitMsg = html;
   _refreshMessage();
 }
@@ -284,16 +230,15 @@ function _refreshMessage() {
   }
 }
 
-// ─── Settings: paramMeta ──────────────────────────────────────────────────────
-// Each entry: { label, type, min?, max?, step?, default? }
+// ─── Settings ─────────────────────────────────────────────────────────────────
 const paramMeta = {
-  estimateBoatSpeed:     { label: 'Estimate boat speed',                  type: 'boolean' },
-  updateCorrectionTable: { label: 'Update correction table',              type: 'boolean' },
+  estimateBoatSpeed:                 { label: 'Estimate boat speed',                       type: 'boolean' },
+  updateCorrectionTable:             { label: 'Update correction table',                   type: 'boolean' },
   suspendLearningOnNavigationState: { label: 'Suspend on navigation.state = motoring', type: 'boolean', description: 'Suspend learning when navigation.state is motoring. Anchored and moored always suspend learning when the path is available.' },
-  assumeCurrent:         { label: 'Assume current during update',         type: 'boolean', description: 'Experimental, works best when currents are relatively stable.' },
-  sogFallback:           { label: 'Groundspeed fallback',                 type: 'boolean', description: 'Output Groundspeed as Boatspeed when the paddlewheel sensor is malfunctioning or stalled.' },
-  stability:             { label: 'Stability (1–20)',                     type: 'number', min: 1, max: 20, step: 1, default: 7, description: 'How quickly the correction table adapts to new observations. Higher values mean slower, more stable changes.' },
-  showStatistics:        { label: 'Show statistics (σ)',                  type: 'boolean', description: 'Display standard deviation alongside smoothed values for debugging.' },
+  assumeCurrent:                     { label: 'Assume current during update',         type: 'boolean', description: 'Experimental, works best when currents are relatively stable.' },
+  sogFallback:                       { label: 'Groundspeed fallback',                 type: 'boolean', description: 'Output Groundspeed as Boatspeed when the paddlewheel sensor is malfunctioning or stalled.' },
+  stability:                         { label: 'Stability (1–20)',                     type: 'number', min: 1, max: 20, step: 1, default: 7, description: 'How quickly the correction table adapts to new observations. Higher values mean slower, more stable changes.' },
+  showStatistics:                    { label: 'Show statistics (σ)',                  type: 'boolean', description: 'Display standard deviation alongside smoothed values for debugging.' },
   smootherClass: {
     label: 'Smoother type', type: 'select',
     description: 'Smoothing applied to all sensor inputs for learning only.',
@@ -320,7 +265,6 @@ const paramMeta = {
   },
 };
 
-// Settings groups for each UI section
 const ESTIMATION_SETTING_KEYS = ['sogFallback'];
 const LEARNING_SETTING_KEYS   = ['stability', 'suspendLearningOnNavigationState', 'assumeCurrent', 'showStatistics'];
 const SMOOTHER_SETTING_KEYS   = [
@@ -330,7 +274,6 @@ const SMOOTHER_SETTING_KEYS   = [
   { key: 'smootherSteadyState', showIf: cfg => cfg.smootherClass === 'KalmanSmoother' },
 ];
 
-// Build one settings control for a key.
 function createSettingControl(key, meta, value) {
   if (meta.type === 'boolean') {
     const lbl = document.createElement('label');
@@ -387,7 +330,6 @@ function createSettingControl(key, meta, value) {
     return sel;
   }
 
-  // fallback: text input
   const inp = document.createElement('input');
   inp.type = 'text'; inp.className = 'form-control form-control-sm';
   inp.value = (value || '').trim();
@@ -443,8 +385,7 @@ function renderSettingsPanel() {
   renderSectionToggles();
 }
 
-// ─── Live data rendering ─────────────────────────────────────────────────────
-
+// ─── Formatting ───────────────────────────────────────────────────────────────
 function formatPolarValue(p) {
   if (!p) return '—';
   const m = metaById[p.id];
@@ -473,10 +414,8 @@ function formatAttitudeValue(a) {
   const m = metaById[a?.id];
   const angleC = buildConverter(m?.displayUnits) || DEFAULTS.angle;
   const roll  = typeof v.roll  === 'number' ? angleC.convert(v.roll).toFixed(angleC.decimals)  : '—';
-  const pitch = typeof v.pitch === 'number' ? angleC.convert(v.pitch).toFixed(angleC.decimals) : '—';
   const showSigma = config?.showStatistics && a?.id?.endsWith('.smoothed');
   const sigmaRoll  = (showSigma && variance && typeof variance.roll  === 'number') ? ` (σ=${angleC.convert(Math.sqrt(variance.roll)).toFixed(angleC.decimals + 2)})`  : '';
-  const sigmaPitch = (showSigma && variance && typeof variance.pitch === 'number') ? ` (σ=${angleC.convert(Math.sqrt(variance.pitch)).toFixed(angleC.decimals + 2)})` : '';
   return `heel ${roll} ${angleC.symbol} ${sigmaRoll} `;
 }
 
@@ -499,12 +438,6 @@ function buildDataTable(rows) {
   tbl.appendChild(tbody);
   return tbl;
 }
-
-// ─── Section rendering ───────────────────────────────────────────────────────
-// Items are routed by explicit ID lists per section.
-// Raw handlers have plain IDs ('boatSpeed', 'groundSpeed', 'attitude') — present when
-// estimateBoatSpeed is enabled. Smoothed wrappers have '<id>.smoothed' IDs — present when
-// updateCorrectionTable is enabled.
 
 function filterById(arr, ids) {
   return ids.flatMap(id => {
@@ -534,37 +467,27 @@ function renderLiveSections() {
   const fallbackInputDeltas = inputDeltas.length ? inputDeltas : filterById(state.deltasAll, ['heading.smoothed', 'boatSpeed.smoothed']);
   const fallbackInputAttitudes = inputAttitudes.length ? inputAttitudes : filterById(state.attitudesAll, ['attitude.smoothed']);
 
-  // Inputs section — raw sensor readings only (smoothing is internal to the plugin)
   renderGroupInto('inputs-values',
     fallbackInputPolars,
     fallbackInputDeltas,
     fallbackInputAttitudes
   );
-  const inputWarningIds = ['boatSpeed', 'attitude', 'heading.angle', 'groundSpeed', 'boatSpeed.smoothed', 'groundSpeed.smoothed', 'heading.smoothed', 'attitude.smoothed'];
-  if (config && config.assumeCurrent) inputWarningIds.push('current.smoothed');
-  renderInputWarnings('inputs-warnings', inputWarningIds);
+  renderInputWarnings('inputs-warnings');
 
-  // Estimation — inputs (raw sensor data used for boat speed estimation)
   renderGroupInto('estimation-inputs',
     filterById(state.polarsAll,    ['groundSpeed']),
     filterById(state.deltasAll,    ['heading.angle', 'boatSpeed']),
     filterById(state.attitudesAll, ['attitude'])
   );
-  // Estimation — intermediates
   renderGroupInto('estimation-intermediates',
     filterById(state.polarsAll, ['boatSpeedRefGround', 'speedCorrection', 'residual', 'residual.smoothed']),
     [], []
   );
-  // Estimation — outputs
   renderGroupInto('estimation-outputs',
     filterById(state.polarsAll, ['correctedBoatSpeed', 'current.smoothed']),
     [], []
   );
-  // Estimation — warnings
-  const estimationWarnings = document.getElementById('estimation-warnings');
-  if (estimationWarnings) estimationWarnings.innerHTML = '';
 
-  // Learning — inputs: smoothed sensors + current if assumeCurrent
   const learningCurrentPolars = (config && config.assumeCurrent)
     ? filterById(state.polarsAll, ['current.smoothed'])
     : [];
@@ -573,64 +496,31 @@ function renderLiveSections() {
     filterById(state.deltasAll,    ['heading.smoothed', 'boatSpeed.smoothed']),
     filterById(state.attitudesAll, ['attitude.smoothed'])
   );
-  // Learning — warnings
-  const learningWarnings = document.getElementById('learning-warnings');
-  if (learningWarnings) {
-    learningWarnings.innerHTML = '';
-    const navState = learningState?.navigationState;
-    if (navState?.enabled && navState.pathKnown === false) {
-      const ul = document.createElement('ul');
-      ul.className = 'list-unstyled small ps-3';
-      const li = document.createElement('li');
-      li.textContent = 'navigation.state is not available; navigation-state learning gate is inactive.';
-      ul.appendChild(li);
-      learningWarnings.appendChild(ul);
-    }
-  }
-  // Learning status section
+
   const statusTbody = document.querySelector('#learning-status-table tbody');
   if (statusTbody) {
-    const learningTextMap = {
-      off: 'Off',
-      stabilizing: 'Stabilising',
-      active: 'Active',
-      suspended: 'Suspended',
-    };
-    const observationTextMap = {
-      accepted: 'Accepted',
-      rejected: 'Rejected',
-      invalid: 'Invalid',
-      skipped: 'Skipped',
-    };
+    const learningTextMap = { off: 'Off', stabilizing: 'Stabilising', active: 'Active', suspended: 'Suspended' };
+    const observationTextMap = { accepted: 'Accepted', rejected: 'Rejected', invalid: 'Invalid', skipped: 'Skipped' };
     const reasonTextMap = {
-      manual: 'Manual toggle off',
-      startup: 'Startup stabilising window',
+      manual: 'Manual toggle off', startup: 'Startup stabilising window',
       observation_reset: 'Recent rejected or invalid observation',
-      nav_state_change: 'navigation.state changed',
-      nav_state: 'Blocked by navigation.state',
-      cog_override: 'Blocked by COG override',
-      accepted: 'Observation recorded',
-      estimator_outlier: 'Estimator rejected observation',
-      missing_input: 'Required learning input unavailable',
-      missing_current_when_required: 'Current estimate unavailable',
-      learning_off: 'Learning is off',
-      stabilizing: 'Stabilising window active',
-      nav_state_blocked: 'Learning blocked by navigation.state',
-      cog_override_active: 'Learning blocked by COG override',
-      stw_below_threshold: 'Below minimum STW for learning',
+      nav_state_change: 'navigation.state changed', nav_state: 'Blocked by navigation.state',
+      cog_override: 'Blocked by COG override', accepted: 'Observation recorded',
+      estimator_outlier: 'Estimator rejected observation', missing_input: 'Required learning input unavailable',
+      missing_current_when_required: 'Current estimate unavailable', learning_off: 'Learning is off',
+      stabilizing: 'Stabilising window active', nav_state_blocked: 'Learning blocked by navigation.state',
+      cog_override_active: 'Learning blocked by COG override', stw_below_threshold: 'Below minimum STW for learning',
       sog_below_threshold: 'Below minimum SOG for learning',
     };
-    const learningText = learningTextMap[learningState?.state] || '\u2014';
-    const obsText = observationTextMap[learningState?.observationState] || '\u2014';
-    const reason = reasonTextMap[learningState?.observationReason]
-      || reasonTextMap[learningState?.reason]
-      || '\u2014';
+    const learningText = learningTextMap[learningState?.state] || '—';
+    const obsText = observationTextMap[learningState?.observationState] || '—';
+    const reason = reasonTextMap[learningState?.observationReason] || reasonTextMap[learningState?.reason] || '—';
     statusTbody.innerHTML =
-        `<tr><td class="text-muted small">Learning</td><td class="small">${learningText}</td></tr>` +
-        `<tr><td class="text-muted small">Observation</td><td class="small">${obsText}</td></tr>` +
+      `<tr><td class="text-muted small">Learning</td><td class="small">${learningText}</td></tr>` +
+      `<tr><td class="text-muted small">Observation</td><td class="small">${obsText}</td></tr>` +
       `<tr><td class="text-muted small">Reason</td><td class="small">${reason}</td></tr>`;
   }
-  // Correction table
+
   const tableEl = document.getElementById('table-container');
   if (tableEl) {
     tableEl.innerHTML = '';
@@ -653,8 +543,6 @@ let lastTickOk = false;
 async function tick() {
   const data = await apiGet('/api/report');
   if (data) {
-    // Recovered from an error — reload meta and config so unit converters,
-    // source lists and settings reflect the (possibly restarted) plugin state.
     if (!lastTickOk) {
       await loadMeta();
       config = await apiGet('/api/settings');
@@ -669,8 +557,7 @@ async function tick() {
     lastTickOk = false;
     state.learningState = null;
   }
-  // Always poll status separately so the message reflects plugin state
-  // even when /api/report fails (plugin stopped/restarting).
+
   const statusData = await fetch(`${API_BASE}/api/status`, { credentials: 'same-origin' })
     .then(r => r.ok ? r.json() : null)
     .catch(() => null);
@@ -684,10 +571,7 @@ function startUpdates() {
   updateTimer = setInterval(tick, 1000);
 }
 
-
-
-// ─── Vanilla modal helpers ────────────────────────────────────────────────────
-
+// ─── Vanilla Modal Helpers ────────────────────────────────────────────────────
 function showModal(id) {
   const el = document.getElementById(id);
   if (!el) return;
@@ -711,8 +595,7 @@ function closeModal(id) {
   if (bd) bd.remove();
 }
 
-// ─── Correction table manager ─────────────────────────────────────────────────
-
+// ─── Correction Table Manager ─────────────────────────────────────────────────
 function setTableName(name) {
   const el = document.getElementById('active-table-name');
   if (el) el.textContent = name ? `(${name})` : '';
@@ -726,7 +609,6 @@ function modalStatus(modalId, msg, ok = false) {
 function initTableManager() {
   if (config && config.tableName) setTableName(config.tableName);
 
-  // Wire close/cancel buttons and click-outside for each modal
   ['modal-create', 'modal-load', 'modal-copy', 'modal-resize'].forEach(id => {
     const el = document.getElementById(id);
     if (!el) return;
@@ -736,100 +618,37 @@ function initTableManager() {
     el.addEventListener('click', e => { if (e.target === el) closeModal(id); });
   });
 
-  // ── New ──
   document.getElementById('btn-tbl-new')?.addEventListener('click', () => {
     modalStatus('create', '');
     showModal('modal-create');
   });
 
-  // ── Load ──
-  document.getElementById('btn-tbl-load')?.addEventListener('click', async () => {
-    const listEl = document.getElementById('table-list');
-    const confirmBtn = document.getElementById('btn-load-confirm');
-    if (listEl) listEl.innerHTML = '<li class="list-group-item text-muted small">Loading…</li>';
-    if (confirmBtn) { confirmBtn.disabled = true; confirmBtn.onclick = null; }
-    modalStatus('load', '');
-    showModal('modal-load');
-    let selectedName = null;
-    const tables = await apiGet('/api/tables');
-    if (!listEl) return;
-    listEl.innerHTML = '';
-    if (!tables || tables.length === 0) {
-      listEl.innerHTML = '<li class="list-group-item text-muted small">No saved tables found.</li>';
-      return;
-    }
-    tables.forEach(t => {
-      const li = document.createElement('li');
-      li.className = 'list-group-item list-group-item-action d-flex justify-content-between align-items-center'
-        + (t.active ? ' active' : '');
-      const span = document.createElement('span');
-      span.textContent = t.name;
-      li.appendChild(span);
-      if (t.active) {
-        const badge = document.createElement('span');
-        badge.className = 'badge badge-light';
-        badge.textContent = 'active';
-        li.appendChild(badge);
-      }
-      li.addEventListener('click', () => {
-        listEl.querySelectorAll('li').forEach(l => l.classList.remove('active'));
-        li.classList.add('active');
-        selectedName = t.name;
-        if (confirmBtn) confirmBtn.disabled = false;
-      });
-      listEl.appendChild(li);
-    });
-    if (confirmBtn) {
-      confirmBtn.onclick = async () => {
-        if (!selectedName) return;
-        modalStatus('load', '');
-        try {
-          const r = await apiPost('/api/tables/load', { name: selectedName });
-          setTableName(r.name);
-          if (config) config.tableName = r.name;
-          closeModal('modal-load');
-          await tick();
-        } catch (e) { modalStatus('load', e.message); }
-      };
-    }
+  document.getElementById('create-mode')?.addEventListener('change', (e) => {
+    const isHeel = e.target.value === 'heel';
+    document.getElementById('row-create-maxDim2').style.display = isHeel ? '' : 'none';
+    document.getElementById('row-create-dim2Step').style.display = isHeel ? '' : 'none';
   });
 
-  // ── Copy ──
-  document.getElementById('btn-tbl-copy')?.addEventListener('click', () => {
-    modalStatus('copy', '');
-    showModal('modal-copy');
-  });
-
-  // ── Resize ──
-  document.getElementById('btn-tbl-resize')?.addEventListener('click', () => {
-    modalStatus('resize', '');
-    const t = Object.values(state.tablesById)[0];
-    if (t && t.row && t.col) {
-      const speedC = unitConverters.speed || DEFAULTS.speed;
-      const angleC = unitConverters.angle || DEFAULTS.angle;
-      const setVal = (id, v, dec) => { const el = document.getElementById(id); if (el) el.value = +v.toFixed(dec); };
-      setVal('resize-maxSpeed',  speedC.convert(t.row.max),  Math.max(speedC.decimals, 1));
-      setVal('resize-speedStep', speedC.convert(t.row.step), Math.max(speedC.decimals, 1));
-      setVal('resize-maxHeel',   angleC.convert(t.col.max),  Math.max(angleC.decimals, 0));
-      setVal('resize-heelStep',  angleC.convert(t.col.step), Math.max(angleC.decimals, 0));
-    }
-    showModal('modal-resize');
-  });
-
-  // ── Create confirm ──
   document.getElementById('btn-create-confirm')?.addEventListener('click', async () => {
     modalStatus('create', '');
+    const mode = document.getElementById('create-mode')?.value || 'twa';
     const speedC = unitConverters.speed || DEFAULTS.speed;
     const angleC = unitConverters.angle || DEFAULTS.angle;
     const invertSpeed = speedC.invert || DEFAULTS.speed.invert;
     const invertAngle = angleC.invert || DEFAULTS.angle.invert;
+
     const body = {
-      name:      (document.getElementById('create-name')?.value || '').trim(),
-      maxSpeed:  invertSpeed(Number(document.getElementById('create-maxSpeed')?.value)),
+      name: (document.getElementById('create-name')?.value || '').trim(),
+      dimensionTwoMode: mode,
+      maxSpeed: invertSpeed(Number(document.getElementById('create-maxSpeed')?.value)),
       speedStep: invertSpeed(Number(document.getElementById('create-speedStep')?.value)),
-      maxHeel:   invertAngle(Number(document.getElementById('create-maxHeel')?.value)),
-      heelStep:  invertAngle(Number(document.getElementById('create-heelStep')?.value)),
     };
+
+    if (mode === 'heel') {
+      body.maxDim2 = invertAngle(Number(document.getElementById('create-maxHeel')?.value));
+      body.dim2Step = invertAngle(Number(document.getElementById('create-heelStep')?.value));
+    }
+
     if (!body.name) { modalStatus('create', 'Name is required.'); return; }
     try {
       const r = await apiPost('/api/tables/create', body);
@@ -838,44 +657,6 @@ function initTableManager() {
       closeModal('modal-create');
       await tick();
     } catch (e) { modalStatus('create', e.message); }
-  });
-
-  // ── Copy confirm ──
-  document.getElementById('btn-copy-confirm')?.addEventListener('click', async () => {
-    modalStatus('copy', '');
-    const newName = (document.getElementById('copy-name')?.value || '').trim();
-    if (!newName) { modalStatus('copy', 'New name is required.'); return; }
-    try {
-      const r = await apiPost('/api/tables/copy', { newName });
-      setTableName(r.name);
-      if (config) config.tableName = r.name;
-      closeModal('modal-copy');
-      await tick();
-    } catch (e) { modalStatus('copy', e.message); }
-  });
-
-  // ── Resize confirm ──
-  document.getElementById('btn-resize-confirm')?.addEventListener('click', async () => {
-    modalStatus('resize', '');
-    const speedC = unitConverters.speed || DEFAULTS.speed;
-    const angleC = unitConverters.angle || DEFAULTS.angle;
-    const invertSpeed = speedC.invert || DEFAULTS.speed.invert;
-    const invertAngle = angleC.invert || DEFAULTS.angle.invert;
-    const body = {
-      maxSpeed:  invertSpeed(Number(document.getElementById('resize-maxSpeed')?.value)),
-      speedStep: invertSpeed(Number(document.getElementById('resize-speedStep')?.value)),
-      maxHeel:   invertAngle(Number(document.getElementById('resize-maxHeel')?.value)),
-      heelStep:  invertAngle(Number(document.getElementById('resize-heelStep')?.value)),
-    };
-    if (!Object.values(body).every(v => Number.isFinite(v) && v > 0)) {
-      modalStatus('resize', 'All dimensions must be positive numbers.');
-      return;
-    }
-    try {
-      await apiPost('/api/tables/resize', body);
-      closeModal('modal-resize');
-      await tick();
-    } catch (e) { modalStatus('resize', e.message); }
   });
 }
 
@@ -889,7 +670,6 @@ async function start() {
 
   await loadMeta();
   await tick();
-  // Re-render settings after first tick so source dropdowns are populated
   renderSettingsPanel();
   startUpdates();
 }

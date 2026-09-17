@@ -1,8 +1,4 @@
 // TableRenderer — purpose-built renderer for the correction table.
-// Rows = speed bins (knots), columns = heel bins (degrees).
-// Each learned cell shows factor deviation (±%) and leeway (°).
-// Background encodes factor: green = paddlewheel reads slow, orange = reads fast.
-// Active cell (last updated) gets a bold border; interpolation neighbours get a faint tint.
 
 const RAD_TO_DEG = 180 / Math.PI;
 const MPS_TO_KNOTS = 1.943844;
@@ -16,11 +12,10 @@ function fmtLeeway(rad) { const d = rad * RAD_TO_DEG; return (d >= 0 ? '+' : '')
 
 class TableRenderer {
 
-  // opts.fmtSpeed / opts.fmtHeel: optional unit-aware formatter functions.
-  // Fall back to the module-level fmtSpeed / fmtHeel when not provided.
   render(data, opts = {}) {
-    const { id, row, col, table, displayAttributes } = data;
-    const label = displayAttributes?.label ?? '';
+    if (!data || !data.table) return document.createElement('div');
+
+    const { id, row, col, table } = data;
     const maxDev = this._computeMaxDev(table);
     const fmtSpeedFn  = opts.fmtSpeed    || fmtSpeed;
     const fmtHeelFn   = opts.fmtHeel     || fmtHeel;
@@ -29,43 +24,85 @@ class TableRenderer {
     const cornerText  = `${speedSymbol} / ${heelSymbol}`;
 
     const el = document.createElement('table');
-    el.id = id;
+    if (id) el.id = id;
     el.classList.add('Table2D');
-    el.appendChild(this._headerRow(col, cornerText, fmtHeelFn));
+    el.appendChild(this._headerRow(col, cornerText, fmtHeelFn, table));
+
+    const numCols = table[0] ? table[0].length : 0;
+    const hasBins = Array.isArray(col?.bins) && col.bins.length === numCols;
 
     let rIndex = 0;
     for (let r = row.min; r <= row.max + 0.01; r += row.step) {
-      el.appendChild(this._dataRow(r, rIndex, col, table, maxDev, fmtSpeedFn));
+      if (!table[rIndex]) break;
+      el.appendChild(this._dataRow(r, rIndex, col, table, maxDev, fmtSpeedFn, hasBins));
       rIndex++;
     }
+
+    const container = document.getElementById('table-container');
+    if (container) {
+      container.innerHTML = '';
+      container.appendChild(el);
+    }
+
     return el;
   }
 
-  _headerRow(col, cornerText, fmtHeelFn) {
+  _headerRow(col, cornerText, fmtHeelFn, table) {
     const tr = document.createElement('tr');
     const th0 = document.createElement('th');
     th0.textContent = cornerText;
     th0.classList.add('TableRowHeader', 'TableCorner');
     tr.appendChild(th0);
-    for (let c = col.min; c <= col.max + 0.01; c += col.step) {
-      const th = document.createElement('th');
-      th.textContent = fmtHeelFn(c);
-      th.classList.add('TablecolumnHeader');
-      tr.appendChild(th);
+
+    const numCols = table && table[0] ? table[0].length : 0;
+    const isTwa6Bin = numCols === 6 || (Array.isArray(col?.bins) && col.bins.length === 6);
+
+    if (isTwa6Bin) {
+      const twaLabels = [
+        'Port Downwind (>120°)',
+        'Port Reach (60°–120°)',
+        'Port Upwind (<60°)',
+        'Stbd Upwind (<60°)',
+        'Stbd Reach (60°–120°)',
+        'Stbd Downwind (>120°)'
+      ];
+
+      for (let cIndex = 0; cIndex < numCols; cIndex++) {
+        const th = document.createElement('th');
+        th.textContent = twaLabels[cIndex] || `Bin ${cIndex + 1}`;
+        th.classList.add('TablecolumnHeader');
+        tr.appendChild(th);
+      }
+    } else {
+      for (let c = col.min; c <= col.max + 0.01; c += col.step) {
+        const th = document.createElement('th');
+        th.textContent = fmtHeelFn(c);
+        th.classList.add('TablecolumnHeader');
+        tr.appendChild(th);
+      }
     }
     return tr;
   }
 
-  _dataRow(r, rIndex, col, table, maxDev, fmtSpeedFn) {
+  _dataRow(r, rIndex, col, table, maxDev, fmtSpeedFn, hasBins) {
     const tr = document.createElement('tr');
     const th = document.createElement('th');
     th.textContent = fmtSpeedFn(r);
     th.classList.add('TableRowHeader');
     tr.appendChild(th);
-    let cIndex = 0;
-    for (let c = col.min; c <= col.max + 0.01; c += col.step) {
-      tr.appendChild(this._cellElement(table[rIndex][cIndex], maxDev));
-      cIndex++;
+
+    const rowCells = table[rIndex] || [];
+    if (hasBins || rowCells.length === 6) {
+      for (let cIndex = 0; cIndex < rowCells.length; cIndex++) {
+        tr.appendChild(this._cellElement(rowCells[cIndex], maxDev));
+      }
+    } else {
+      let cIndex = 0;
+      for (let c = col.min; c <= col.max + 0.01; c += col.step) {
+        if (cIndex >= rowCells.length) break;
+        tr.appendChild(this._cellElement(rowCells[cIndex], maxDev));
+        cIndex++;
+      }
     }
     return tr;
   }
@@ -113,30 +150,29 @@ class TableRenderer {
     return td;
   }
 
-  // Find the largest absolute factor deviation from 1 to normalise the color scale.
   _computeMaxDev(table) {
     let maxDev = 0;
+    if (!Array.isArray(table)) return 0.05;
     for (const row of table) {
+      if (!Array.isArray(row)) continue;
       for (const cell of row) {
         if (!cell || cell.N === 0 || !Number.isFinite(cell.factor)) continue;
         const dev = Math.abs(cell.factor - 1);
         if (dev > maxDev) maxDev = dev;
       }
     }
-    return maxDev || 0.05; // avoid a fully white table when all factors are near 1
+    return maxDev || 0.05;
   }
 
-  // factor < 1: paddlewheel reads fast → white→orange
-  // factor > 1: paddlewheel reads slow → white→green
   _factorColor(factor, maxDev) {
     if (!Number.isFinite(factor)) return '';
     const dev = factor - 1;
     if (Math.abs(dev) < 1e-6) return '';
     const a = Math.min(1, Math.abs(dev) / maxDev);
     if (dev < 0) {
-      return `rgb(255,${Math.round(255 - 90 * a)},${Math.round(255 * (1 - a))})`; // white→orange
+      return `rgb(255,${Math.round(255 - 90 * a)},${Math.round(255 * (1 - a))})`;
     } else {
-      return `rgb(${Math.round(255 * (1 - a))},${Math.round(255 - 95 * a)},${Math.round(255 - 175 * a)})`; // white→green
+      return `rgb(${Math.round(255 * (1 - a))},${Math.round(255 - 95 * a)},${Math.round(255 - 175 * a)})`;
     }
   }
 }

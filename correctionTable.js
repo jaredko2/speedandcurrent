@@ -1,11 +1,10 @@
-const { Table2D} = require('signalkutilities');
+const { Table2D } = require('signalkutilities');
 const { KalmanFilter, State } = require('kalman-filter');
 
-// Module-level helpers — avoids creating new Function objects on every Kalman update call
 function _rotateValue(cos, sin, vector) {
   return [
-     cos * vector[0] + sin * vector[1],
-    -sin * vector[0] + cos * vector[1]
+    cos * vector[0] + sin * vector[1],
+   -sin * vector[0] + cos * vector[1]
   ];
 }
 
@@ -16,32 +15,23 @@ function _rotateVariance(cos, sin, vector) {
   ];
 }
 
-class CorrectionTable extends Table2D{
-  /**
-   * Represents a 2D correction table for heel and speed.
-   */
-
-
-
+class CorrectionTable extends Table2D {
   static fromJSON(data, stability) {
-    const table = new CorrectionTable(data.id, data.row, data.col, stability);
-    table.table = data.table.map(row => row.map(cellData => CorrectionEstimator.fromJSON(cellData, stability)));
+    const table = new CorrectionTable(
+      data.id, 
+      data.row, 
+      data.col, 
+      stability, 
+      data.dimensionTwoMode || 'twa'
+    );
+    if (Array.isArray(data.table)) {
+      table.table = data.table.map(row => 
+        row.map(cellData => CorrectionEstimator.fromJSON(cellData, stability))
+      );
+    }
     return table;
   }
 
-  /**
-   * Resample an existing table onto a new grid conservatively.
-   * - Seeds mean from oldTable.getCorrection at each new cell center
-   * - Seeds diagonal covariance with a per-axis floor
-   * - Sets index (N) = 0 so all cells can re-learn on the new grid
-   *
-   * @param {CorrectionTable} oldTable - Source table to sample from
-   * @param {{min:number,max:number,step:number}} newRow - New speed axis definition (SI units)
-   * @param {{min:number,max:number,step:number}} newCol - New heel axis definition (SI units)
-   * @param {number} [stability=5] - Stability passed to new table filter model
-   * @param {number} [varianceFloor=1e-4] - Floor applied to cov[0][0] and cov[1][1]
-   * @returns {CorrectionTable}
-   */
   static resample(oldTable, newRow, newCol, stability = 5, varianceFloor = 1e-4) {
     const newTable = new CorrectionTable(oldTable.id, newRow, newCol, stability);
 
@@ -60,8 +50,8 @@ class CorrectionTable extends Table2D{
         const covYY = Math.max(Number.isFinite(variance?.y) ? variance.y : 0, varianceFloor);
         const covariance = [[covXX, 0], [0, covYY]];
 
-        // Decide initialization index based on coverage/support from old table
         const inBounds = (
+          Array.isArray(oldTable.min) && Array.isArray(oldTable.max) &&
           speed >= oldTable.min[0] && speed <= oldTable.max[0] &&
           heel  >= oldTable.min[1] && heel  <= oldTable.max[1]
         );
@@ -75,10 +65,8 @@ class CorrectionTable extends Table2D{
             effectiveN += w * N;
           }
         }
-        // Heuristic: require in-bounds AND at least 2 learned neighbours AND some effective support
         const index = (inBounds && supportCount >= 2 && effectiveN >= 1) ? 1 : 0;
 
-        // Seed prior with mean and conservative covariance; index as decided above
         newTable.table[i][j].filterState = new State({ mean, covariance, index });
       }
     }
@@ -86,141 +74,234 @@ class CorrectionTable extends Table2D{
     return newTable;
   }
 
-  /**
-   * Convenience to resample from serialized JSON table data
-   */
   static resampleFromJSON(data, newRow, newCol, stability = 5, varianceFloor = 1e-4) {
     const oldTable = CorrectionTable.fromJSON(data, stability);
     return CorrectionTable.resample(oldTable, newRow, newCol, stability, varianceFloor);
   }
 
-  constructor(id, row, col, stability=5) {
+  constructor(id, row, col, stability = 5, dimensionTwoMode = 'twa') {
     super(id, row, col, CorrectionEstimator, CorrectionEstimator.getFilterModel(stability));
+    this.dimensionTwoMode = dimensionTwoMode;
     this.lastUpdatedCell = null;
     this.lastUpdateResult = null;
     this.neighbours = [];
+
+    const minRow = (this.min && Number.isFinite(this.min[0])) ? this.min[0] : 0;
+    const minCol = (this.min && Number.isFinite(this.min[1])) ? this.min[1] : (col ? (Array.isArray(col.bins) ? col.bins[0] : col.min) : 0);
+    const stepRow = (this.step && Number.isFinite(this.step[0])) ? this.step[0] : 0.514;
+    const stepCol = (this.step && Number.isFinite(this.step[1])) ? this.step[1] : 0.139;
+
+    this.min = [minRow, minCol];
+    this.step = [stepRow, stepCol];
+
+    if (Array.isArray(col && col.bins) && col.bins.length > 0) {
+      const numRows = Math.floor((this.max[0] - this.min[0]) / this.step[0]) + 1;
+      const numCols = col.bins.length;
+      const filterModel = CorrectionEstimator.getFilterModel(stability);
+
+      this.table = Array.from({ length: numRows }, () =>
+        Array.from({ length: numCols }, () => new CorrectionEstimator(filterModel, null))
+      );
+    }
   }
-  
+
+  getCell(rowVal, colVal) {
+    if (!this.table || this.table.length === 0) return null;
+    const minR = (Array.isArray(this.min) && Number.isFinite(this.min[0])) ? this.min[0] : 0;
+    const stepR = (Array.isArray(this.step) && Number.isFinite(this.step[0])) ? this.step[0] : 0.514;
+
+    let rIdx = Math.floor((rowVal - minR) / stepR);
+    rIdx = Math.max(0, Math.min(rIdx, this.table.length - 1));
+    const targetRow = this.table[rIdx] || [];
+
+    let cIdx = 0;
+    const colObj = this.col || {};
+    if (this.dimensionTwoMode === 'twa' && Array.isArray(colObj.bins)) {
+      // Angular distance matching to locate exact TWA bin
+      let minDiff = Infinity;
+      colObj.bins.forEach((binRad, idx) => {
+        let diff = Math.abs(colVal - binRad);
+        while (diff > Math.PI) diff -= 2 * Math.PI;
+        diff = Math.abs(diff);
+        if (diff < minDiff) {
+          minDiff = diff;
+          cIdx = idx;
+        }
+      });
+    } else {
+      const minC = (Array.isArray(this.min) && Number.isFinite(this.min[1])) ? this.min[1] : 0;
+      const stepC = (Array.isArray(this.step) && Number.isFinite(this.step[1])) ? this.step[1] : 0.139;
+      cIdx = Math.floor((colVal - minC) / stepC);
+      cIdx = Math.max(0, Math.min(cIdx, targetRow.length - 1));
+    }
+
+    return targetRow[cIdx] || null;
+  }
+
   update(speed, heel, groundSpeed, current, boatSpeed, heading) {
     const cell = this.getCell(speed, heel);
-    const accepted = cell?.update(groundSpeed, current, boatSpeed, heading);
+    if (!cell) {
+      this.lastUpdateResult = 'rejected';
+      return;
+    }
+    const accepted = cell.update(groundSpeed, current, boatSpeed, heading);
     this.lastUpdatedCell = cell;
     this.lastUpdateResult = accepted === true ? 'accepted' : 'rejected';
   }
 
   getCorrection(speed, heel) {
-    this.neighbours = this.findClosest(speed, heel, 5);
-    if (this.neighbours.length == 0) return { correction: {x: 0, y: 0}, variance: null };
-    // Compute the correction and variance from the neighbours
+    const isTwaMode = this.dimensionTwoMode === 'twa' && Array.isArray(this.col?.bins);
+    const boundsValid = Array.isArray(this.min) && this.min.length >= 2 && Array.isArray(this.step);
+
+    if (!isTwaMode && boundsValid && typeof this.findClosest === 'function') {
+      try {
+        this.neighbours = this.findClosest(speed, heel, 5) || [];
+      } catch (err) {
+        const directCell = this.getCell(speed, heel);
+        this.neighbours = directCell ? [{ cell: directCell, dist: 0 }] : [];
+      }
+    } else {
+      const directCell = this.getCell(speed, heel);
+      this.neighbours = directCell ? [{ cell: directCell, dist: 0 }] : [];
+    }
+
+    if (!Array.isArray(this.neighbours) || this.neighbours.length === 0) {
+      return { correction: { x: 0, y: 0 }, variance: { x: 0, y: 0 } };
+    }
+
     let x = 0;
     let y = 0;
     let varX = 0;
     let varY = 0;
     let totalWeight = 0;
+
     for (const neighbour of this.neighbours) {
-      const { cell:correction, dist } = neighbour;
-      if (correction.N > 0) {
-        const weight = 1 / (dist + 1e-6); 
+      const { cell: correction, dist } = neighbour;
+      if (correction && correction.N > 0) {
+        const weight = 1 / (dist + 1e-6);
         neighbour.normWeight = weight;
-        x += correction.x * weight;
-        y += correction.y * weight;
-        varX += correction.covariance[0][0] * weight ** 2;
-        varY += correction.covariance[1][1] * weight ** 2;
+        x += (correction.x || 0) * weight;
+        y += (correction.y || 0) * weight;
+        if (correction.covariance) {
+          varX += (correction.covariance[0][0] || 0) * (weight ** 2);
+          varY += (correction.covariance[1][1] || 0) * (weight ** 2);
+        }
         totalWeight += weight;
       }
     }
+
     if (totalWeight > 0) {
       for (const neighbour of this.neighbours) {
         neighbour.normWeight /= totalWeight;
       }
+      const tw2 = totalWeight * totalWeight;
+      x /= totalWeight;
+      y /= totalWeight;
+      varX /= tw2;
+      varY /= tw2;
+      this.totalWeight = totalWeight;
+    } else {
+      return { correction: { x: 0, y: 0 }, variance: { x: 0, y: 0 } };
     }
-
-    if (totalWeight === 0) return { correction: { x: 0, y: 0 }, variance: { x: 0, y: 0 } };
-
-    // Compute the final correction and variance
-    // Variance of a weighted mean: Σ(w²·var_i) / (Σw)²
-    const tw2 = totalWeight * totalWeight;
-    x /= totalWeight;
-    y /= totalWeight;
-    varX /= tw2;
-    varY /= tw2;
-    this.totalWeight = totalWeight;
 
     return { correction: { x, y }, variance: { x: varX, y: varY } };
   }
-  
+
   report() {
+    const baseReport = typeof super.report === 'function' ? super.report() : {};
+    const colObj = this.col || {};
+
     return {
+      ...baseReport,
       id: this.id,
-      row: { min: this.min[0], max: this.max[0], step: this.step[0] },
-      col: { min: this.min[1], max: this.max[1], step: this.step[1] },
-      table: this.table.map((row, rowIndex) =>
-        row.map((correction, colIndex) => {
+      dimensionTwoMode: this.dimensionTwoMode,
+      row: { 
+        min: this.min ? this.min[0] : (this.row ? this.row.min : 0), 
+        max: this.max ? this.max[0] : (this.row ? this.row.max : 0), 
+        step: this.step ? this.step[0] : (this.row ? this.row.step : 0) 
+      },
+      col: {
+        min: this.min ? this.min[1] : (colObj.min || 0),
+        max: this.max ? this.max[1] : (colObj.max || 0),
+        step: this.step ? this.step[1] : (colObj.step || 0),
+        bins: colObj.bins || null
+      },
+      table: (this.table || []).map((row, rowIndex) =>
+        (row || []).map((correction, colIndex) => {
           const cellReport = correction.report();
-          // Derive the bin coordinates from indices
-          const speedBin = this.min[0] + this.step[0] * rowIndex; // row axis represents speed
-          const heelBin = this.min[1] + this.step[1] * colIndex; // col axis represents heel
-          // Compute forward speed after longitudinal correction
+          const speedMin = this.min ? this.min[0] : 0;
+          const speedStep = this.step ? this.step[0] : 0.514;
+          const speedBin = speedMin + speedStep * rowIndex;
+
+          const dim2Bins = colObj.bins || null;
+          const dim2Min = this.min ? this.min[1] : (colObj.min || 0);
+          const dim2Step = this.step ? this.step[1] : (colObj.step || 0.139);
+
+          const heelBin = (Array.isArray(dim2Bins) && dim2Bins[colIndex] !== undefined)
+            ? dim2Bins[colIndex]
+            : (dim2Min + dim2Step * colIndex);
+
           const forward = speedBin + cellReport.x;
-          // Factor (forward relative to original speed); guard division by zero
           const factor = speedBin > 0 ? forward / speedBin : null;
-          // Leeway angle based on sideways over forward; only if forward > 0
           const leeway = (forward > 0 && cellReport.N > 0) ? Math.atan2(cellReport.y, forward) : null;
-          // Trace ( cov_xx + cov_yy ) when covariance available and N>0
+
           let trace = null;
-          if (cellReport.N > 0) {
+          if (cellReport.N > 0 && correction.covariance) {
             const cov = correction.covariance;
-            if (cov && Array.isArray(cov) && cov[0] && cov[1] && Number.isFinite(cov[0][0]) && Number.isFinite(cov[1][1])) {
+            if (Array.isArray(cov) && cov[0] && cov[1] && Number.isFinite(cov[0][0]) && Number.isFinite(cov[1][1])) {
               trace = cov[0][0] + cov[1][1];
             }
           }
+
           cellReport.forward = forward;
           cellReport.factor = factor;
           cellReport.leeway = leeway;
           cellReport.trace = trace;
           cellReport.speedBin = speedBin;
           cellReport.heelBin = heelBin;
-          // Mark selected if this is the last updated cell
           cellReport.displayAttributes = {
+            ...(cellReport.displayAttributes || {}),
             selected: correction === this.lastUpdatedCell
           };
-          const found = this.neighbours.find(n => n.cell === correction);
-          if (found) {
-            cellReport.displayAttributes.normWeight = found.normWeight;
-          } else {
-            cellReport.displayAttributes.normWeight = 0;
-          }
+
+          const found = (this.neighbours || []).find(n => n.cell === correction);
+          cellReport.displayAttributes.normWeight = found ? found.normWeight : 0;
+
           return cellReport;
         })
       ),
-      displayAttributes: this.displayAttributes,
-      lastUpdateResult: this.lastUpdateResult ?? null
+      displayAttributes: this.displayAttributes || baseReport.displayAttributes,
+      lastUpdateResult: this.lastUpdateResult ?? baseReport.lastUpdateResult ?? null
     };
   }
 
+  toJSON() {
+    return {
+      id: this.id,
+      dimensionTwoMode: this.dimensionTwoMode,
+      row: this.row,
+      col: this.col,
+      table: this.table
+    };
+  }
 }
 
 class CorrectionEstimator {
-  /**
-   * Represents a Kalman correction at a cell in a correction table
-   */
-
   static fromJSON(data, stability) {
     const filterModel = CorrectionEstimator.getFilterModel(stability);
-    const estimator = new CorrectionEstimator(filterModel, data.state);
-    return estimator;
+    return new CorrectionEstimator(filterModel, data ? data.state : null);
   }
 
   static getFilterModel(stability = 5) {
     return {
       observation: {
-        stateProjection: [[1, 0], [0, 1]], // observation matrix H
-        covariance: [[1, 0], [0, 1]], //measurement noise R
+        stateProjection: [[1, 0], [0, 1]],
+        covariance: [[1, 0], [0, 1]],
         dimension: 2
       },
       dynamic: {
-        transition: [[1, 0], [0, 1]], // state transition matrix F
-        covariance: [1/10**stability, 1/10**stability],// process noise covariance matrix Q
+        transition: [[1, 0], [0, 1]],
+        covariance: [1 / (10 ** stability), 1 / (10 ** stability)],
       }
     };
   }
@@ -232,56 +313,54 @@ class CorrectionEstimator {
       this.filterState = new State(initialState);
     }
   }
-  
+
   update(groundSpeed, current, boatSpeed, heading) {
-    if(groundSpeed.xVariance == null || groundSpeed.yVariance == null ||
-       current.xVariance == null || current.yVariance == null ||
-       boatSpeed.xVariance == null || boatSpeed.yVariance == null ) {
+    if (!groundSpeed || !current || !boatSpeed ||
+        groundSpeed.xVariance == null || groundSpeed.yVariance == null ||
+        current.xVariance == null || current.yVariance == null ||
+        boatSpeed.xVariance == null || boatSpeed.yVariance == null) {
        return false;
     }
-    // Rotation matrix for -theta
+
     const cosTheta = Math.cos(heading);
     const sinTheta = Math.sin(heading);
 
-    var groundVector = _rotateValue(cosTheta, sinTheta, groundSpeed.vector);
-    var currentVector = _rotateValue(cosTheta, sinTheta, current.vector);
-    var boatVector = boatSpeed.vector;
+    const groundVector = _rotateValue(cosTheta, sinTheta, groundSpeed.vector);
+    const currentVector = _rotateValue(cosTheta, sinTheta, current.vector);
+    const boatVector = boatSpeed.vector;
 
     const observation = [
       -boatVector[0] + groundVector[0] - currentVector[0],
       -boatVector[1] + groundVector[1] - currentVector[1]
     ];
 
-    var groundCov = _rotateVariance(cosTheta, sinTheta, groundSpeed.variance);
-    var currentCov = _rotateVariance(cosTheta, sinTheta, current.variance);
-    var boatCov = [[boatSpeed.xVariance, 0], [0, boatSpeed.yVariance]];
+    const groundCov = _rotateVariance(cosTheta, sinTheta, groundSpeed.variance);
+    const currentCov = _rotateVariance(cosTheta, sinTheta, current.variance);
+    const boatCov = [[boatSpeed.xVariance, 0], [0, boatSpeed.yVariance]];
 
-    const observationCovariance = [[
-      groundCov[0][0] + currentCov[0][0] + boatCov[0][0],
-      groundCov[0][1] + currentCov[0][1] + boatCov[0][1]],
-    [
-      groundCov[1][0] + currentCov[1][0] + boatCov[1][0],
-      groundCov[1][1] + currentCov[1][1] + boatCov[1][1]],
+    const observationCovariance = [
+      [
+        groundCov[0][0] + currentCov[0][0] + boatCov[0][0],
+        groundCov[0][1] + currentCov[0][1] + boatCov[0][1]
+      ],
+      [
+        groundCov[1][0] + currentCov[1][0] + boatCov[1][0],
+        groundCov[1][1] + currentCov[1][1] + boatCov[1][1]
+      ]
     ];
-    // Mahalanobis distance check.
-    // For empty cells (filterState === null) we use a diffuse prior — mean (0,0),
-    // variance DIFFUSE_PRIOR_VAR — expressing "assume no correction needed, but
-    // with high uncertainty".  This gates the very first observation instead of
-    // accepting it unconditionally, preventing a single outlier from locking a
-    // cell at a bad value.
-    const DIFFUSE_PRIOR_VAR = 1.0; // (m/s)² — rejects corrections > ~3 m/s from zero
+
+    const DIFFUSE_PRIOR_VAR = 1.0;
     const priorMean = this.filterState !== null
       ? [this.filterState.mean[0][0], this.filterState.mean[1][0]]
       : [0, 0];
     const priorCov = this.filterState !== null
       ? this.filterState.covariance
       : [[DIFFUSE_PRIOR_VAR, 0], [0, DIFFUSE_PRIOR_VAR]];
+
     const inno = [observation[0] - priorMean[0], observation[1] - priorMean[1]];
     const S = [
-      [priorCov[0][0] + observationCovariance[0][0],
-       priorCov[0][1] + observationCovariance[0][1]],
-      [priorCov[1][0] + observationCovariance[1][0],
-       priorCov[1][1] + observationCovariance[1][1]]
+      [priorCov[0][0] + observationCovariance[0][0], priorCov[0][1] + observationCovariance[0][1]],
+      [priorCov[1][0] + observationCovariance[1][0], priorCov[1][1] + observationCovariance[1][1]]
     ];
     const det = S[0][0] * S[1][1] - S[0][1] * S[1][0];
     if (Number.isFinite(det) && det > 1e-12) {
@@ -297,36 +376,29 @@ class CorrectionEstimator {
     return true;
   }
 
-
   report() {
     return { x: this.x, y: this.y, N: this.N };
   }
 
   get N() {
-    if (this.filterState == null) return 0;
-    return this.filterState.index;
+    return this.filterState ? this.filterState.index : 0;
   }
 
   get x() {
-    if (this.filterState == null) return 0;
-    return this.filterState.mean[0][0];
+    return this.filterState ? this.filterState.mean[0][0] : 0;
   }
 
   get y() {
-    if (this.filterState == null) return 0;
-    return this.filterState.mean[1][0];
+    return this.filterState ? this.filterState.mean[1][0] : 0;
   }
 
   get covariance() {
-    return this.filterState.covariance;
+    return this.filterState ? this.filterState.covariance : null;
   }
-
 
   toJSON() {
-    return this.N != 0 ? { state: this.filterState } : { state: null };
+    return this.N !== 0 ? { state: this.filterState } : { state: null };
   }
-
 }
 
-
-module.exports = { CorrectionTable };
+module.exports = { CorrectionTable, CorrectionEstimator };
