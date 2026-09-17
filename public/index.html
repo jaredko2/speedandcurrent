@@ -1,56 +1,363 @@
-<!-- Create table modal -->
-<div class="modal fade" id="modal-create" tabindex="-1" role="dialog">
-  <div class="modal-dialog" role="document">
-    <div class="modal-content">
-      <div class="modal-header">
-        <h5 class="modal-title">New Correction Table</h5>
-        <button type="button" class="close" data-dismiss="modal"><span>&times;</span></button>
-      </div>
-      <div class="modal-body">
-        <table class="table table-sm table-borderless">
-          <tbody>
-            <tr>
-              <td>Table Name</td>
-              <td><input type="text" id="create-name" class="form-control form-control-sm" placeholder="e.g. cat-twa-2026" style="width:180px"></td>
-            </tr>
-            <tr>
-              <td>2nd Dimension Mode</td>
-              <td>
-                <select id="create-mode" class="form-select form-select-sm" style="width:180px">
-                  <option value="twa" selected>TWA (True Wind Angle)</option>
-                  <option value="heel">Heel Angle (Roll)</option>
-                </select>
-              </td>
-            </tr>
-            <tr>
-              <td id="create-maxSpeed-label">Max speed (kn)</td>
-              <td><input type="number" id="create-maxSpeed" class="form-control form-control-sm" value="12" min="1" max="30" step="1" style="width:80px"></td>
-            </tr>
-            <tr>
-              <td id="create-speedStep-label">Speed step (kn)</td>
-              <td><input type="number" id="create-speedStep" class="form-control form-control-sm" value="1" min="0.1" max="5" step="0.1" style="width:80px"></td>
-            </tr>
-            <tr id="row-create-maxDim2" style="display:none">
-              <td id="create-maxDim2-label">Max heel (&deg;)</td>
-              <td><input type="number" id="create-maxDim2" class="form-control form-control-sm" value="32" min="1" max="60" step="1" style="width:80px"></td>
-            </tr>
-            <tr id="row-create-dim2Step" style="display:none">
-              <td id="create-dim2Step-label">Heel step (&deg;)</td>
-              <td><input type="number" id="create-dim2Step" class="form-control form-control-sm" value="8" min="1" max="20" step="1" style="width:80px"></td>
-            </tr>
-          </tbody>
-        </table>
-        <div id="create-regime-note" class="small text-muted border-top pt-2 mt-2">
-          <strong>Signed TWA Buckets:</strong> Generates 6 discrete column bins:<br>
-          <code>[-145&deg;, -90&deg;, -40&deg;, +40&deg;, +90&deg;, +145&deg;]</code><br>
-          (&lt;60&deg; Upwind, 60&deg;–120&deg; Reaching, &gt;120&deg; Downwind).
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Speed and Current</title>
+  <script>
+    (async () => {
+      const appendStylesheet = (href) => {
+        const el = document.createElement('link');
+        el.rel  = 'stylesheet';
+        el.href = href;
+        document.head.appendChild(el);
+      };
+      let manifestFailure = 'manifest contained no CSS assets';
+      try {
+        const res = await fetch('/admin/.vite/manifest.json');
+        if (res.ok) {
+          const manifest = await res.json();
+          const stylesheets = new Set();
+          for (const entry of Object.values(manifest)) {
+            if (entry.file?.endsWith('.css')) {
+              stylesheets.add(entry.file);
+            }
+            if (entry.isEntry) {
+              for (const css of entry.css ?? []) {
+                stylesheets.add(css);
+              }
+            }
+          }
+          if (stylesheets.size > 0) {
+            for (const css of stylesheets) appendStylesheet('/admin/' + css);
+            return;
+          }
+        } else {
+          manifestFailure = `manifest request returned ${res.status}`;
+        }
+      } catch (e) {
+        manifestFailure = `manifest request failed: ${e.message}`;
+      }
+      try {
+        const res  = await fetch('/');
+        const html = await res.text();
+        const doc  = new DOMParser().parseFromString(html, 'text/html');
+        const link = doc.querySelector('link[rel="stylesheet"]');
+        if (link) {
+          appendStylesheet(new URL(link.getAttribute('href'), res.url).href);
+          return;
+        }
+        console.warn(`[webapp] Could not load SignalK admin stylesheet: ${manifestFailure}; legacy admin page contained no stylesheet link.`);
+      } catch (e) {
+        console.warn(`[webapp] Could not load SignalK admin stylesheet: ${manifestFailure}; legacy fallback failed: ${e.message}`);
+      }
+    })();
+  </script>
+  <link rel="stylesheet" href="main.css">
+</head>
+
+<body class="app header-fixed sidebar-fixed aside-menu-fixed aside-menu-hidden">
+
+  <header class="app-header navbar navbar-light bg-white">
+    <div class="d-flex align-items-center">
+      <a class="d-flex align-items-center gap-2 me-0 text-decoration-none" href="#">
+        <img src="icon.png" alt="" style="height:48px;width:auto">
+        <span class="app-title">Speed &amp; Current</span>
+      </a>
+      <button class="navbar-toggler sidebar-toggler ms-2" type="button" id="sidebarToggler">
+        <span class="navbar-toggler-icon"></span>
+      </button>
+    </div>
+    <span id="message" class="small ms-auto me-3"></span>
+  </header>
+
+  <div class="app-body">
+
+    <div class="sidebar">
+      <nav class="sidebar-nav">
+        <ul id="main-nav" class="nav">
+          <li class="nav-item">
+            <a class="nav-link active" href="#" data-section="inputs">Inputs</a>
+          </li>
+          <li class="nav-item">
+            <a class="nav-link" href="#" data-section="estimation">Boatspeed Estimation</a>
+          </li>
+          <li class="nav-item">
+            <a class="nav-link" href="#" data-section="learning">Correction Table Learning</a>
+          </li>
+          <li class="nav-item">
+            <a class="nav-link" href="#" data-section="table">Correction Table</a>
+          </li>
+        </ul>
+      </nav>
+      <button class="sidebar-minimizer brand-minimizer" type="button" id="sidebarMinimizer"></button>
+    </div>
+
+    <main class="main">
+      <div class="container-fluid pt-3">
+
+        <!-- ===== INPUTS SECTION ===== -->
+        <div id="section-inputs" class="app-section">
+          <div class="card">
+            <div class="card-header fw-bold text-uppercase">Inputs</div>
+            <div class="card-body">
+              <h6 class="text-uppercase fw-bold text-muted border-bottom pb-1 mb-1 small">Live Values</h6>
+              <div id="inputs-values"></div>
+              <div id="inputs-warnings"></div>
+            </div>
+          </div>
         </div>
+
+        <!-- ===== BOATSPEED ESTIMATION SECTION ===== -->
+        <div id="section-estimation" class="app-section" style="display:none">
+          <div class="card">
+            <div class="card-header d-flex align-items-center justify-content-between">
+              <span class="fw-bold text-uppercase">Boatspeed Estimation</span>
+              <label class="switch switch-text switch-primary mb-0" id="toggle-estimateBoatSpeed-label" title="Enable boatspeed estimation">
+                <input type="checkbox" class="switch-input form-check-input" id="toggle-estimateBoatSpeed">
+                <span class="switch-label" data-on="On" data-off="Off"></span>
+                <span class="switch-handle"></span>
+              </label>
+            </div>
+            <div class="card-body">
+              <h6 class="text-uppercase fw-bold text-muted border-bottom pb-1 mb-1 small">Settings</h6>
+              <table class="table table-sm table-borderless mb-0" id="estimation-settings-table">
+                <tbody></tbody>
+              </table>
+              <h6 class="text-uppercase fw-bold text-muted border-bottom pb-1 mt-3 mb-1 small">Inputs</h6>
+              <div id="estimation-inputs"></div>
+              <h6 class="text-uppercase fw-bold text-muted border-bottom pb-1 mt-3 mb-1 small">Intermediates</h6>
+              <div id="estimation-intermediates"></div>
+              <h6 class="text-uppercase fw-bold text-muted border-bottom pb-1 mt-3 mb-1 small">Outputs</h6>
+              <div id="estimation-outputs"></div>
+              <div id="estimation-warnings"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ===== CORRECTION TABLE LEARNING SECTION ===== -->
+        <div id="section-learning" class="app-section" style="display:none">
+          <div class="card">
+            <div class="card-header d-flex align-items-center justify-content-between">
+              <span class="fw-bold text-uppercase">Correction Table Learning</span>
+              <label class="switch switch-text switch-primary mb-0" id="toggle-updateCorrectionTable-label" title="Enable correction table learning">
+                <input type="checkbox" class="switch-input form-check-input" id="toggle-updateCorrectionTable">
+                <span class="switch-label" data-on="On" data-off="Off"></span>
+                <span class="switch-handle"></span>
+              </label>
+            </div>
+            <div class="card-body">
+              <h6 class="text-uppercase fw-bold text-muted border-bottom pb-1 mb-1 small">Settings</h6>
+              <table class="table table-sm table-borderless mb-0" id="learning-settings-table">
+                <tbody></tbody>
+              </table>
+              <h6 class="text-uppercase fw-bold text-muted border-bottom pb-1 mt-3 mb-1 small">Smoother</h6>
+              <table class="table table-sm table-borderless mb-0" id="smoother-settings-table">
+                <tbody></tbody>
+              </table>
+              <h6 class="text-uppercase fw-bold text-muted border-bottom pb-1 mt-3 mb-1 small">Inputs</h6>
+              <div id="learning-inputs"></div>
+              <h6 class="text-uppercase fw-bold text-muted border-bottom pb-1 mt-3 mb-1 small">Status</h6>
+              <table class="table table-sm table-borderless mb-0" id="learning-status-table">
+                <tbody></tbody>
+              </table>
+              <div id="learning-warnings"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ===== CORRECTION TABLE SECTION ===== -->
+        <div id="section-table" class="app-section" style="display:none">
+
+          <div class="card">
+            <div class="card-header" style="position:relative">
+              <span class="fw-bold text-uppercase">Correction Table</span>
+              <span id="active-table-name" class="ms-2 text-muted small"></span>
+              <div style="position:absolute;right:1rem;top:0;bottom:0;display:flex;align-items:center;gap:0.5rem;">
+                <button id="btn-tbl-new" class="btn btn-sm btn-outline-secondary">New</button>
+                <button id="btn-tbl-load" class="btn btn-sm btn-outline-secondary">Load</button>
+                <button id="btn-tbl-copy" class="btn btn-sm btn-outline-secondary">Copy</button>
+                <button id="btn-tbl-resize" class="btn btn-sm btn-outline-secondary">Resize</button>
+              </div>
+            </div>
+            <div class="card-body">
+              <div class="table-legend small text-muted mb-3">
+                <div class="table-legend-row">
+                  <span class="legend-swatch legend-swatch--green"></span>
+                  <span><strong>Green</strong> — paddlewheel reads slow (factor &gt; 1, speed is corrected up)</span>
+                </div>
+                <div class="table-legend-row">
+                  <span class="legend-swatch legend-swatch--orange"></span>
+                  <span><strong>Orange</strong> — paddlewheel reads fast (factor &lt; 1, speed is corrected down)</span>
+                </div>
+                <div class="table-legend-row">
+                  <span class="legend-swatch legend-swatch--stripe"></span>
+                  <span><strong>Stripe angle</strong> — encodes leeway direction; stripes are tilted proportionally to the leeway correction (&deg;)</span>
+                </div>
+                <div class="table-legend-row">
+                  <span class="legend-swatch legend-swatch--active">+1.2%</span>
+                  <span><strong>Blue text</strong> — most recently updated cell</span>
+                </div>
+                <div class="table-legend-row">
+                  <span class="legend-swatch legend-swatch--neighbour"></span>
+                  <span><strong>Faint tint</strong> — interpolation neighbours used in the current estimate</span>
+                </div>
+                <div class="table-legend-row mt-1">
+                  <span class="legend-label-wide">Cell values:</span>
+                  <span>top = speed-correction factor (&plusmn;%), bottom = leeway correction (&plusmn;&deg;)</span>
+                </div>
+              </div>
+              <div id="table-container"></div>
+            </div>
+          </div>
+        </div>
+
       </div>
-      <div class="modal-footer">
-        <span id="modal-create-status" class="small text-danger mr-auto"></span>
-        <button type="button" class="btn btn-secondary" data-dismiss="modal">Cancel</button>
-        <button type="button" class="btn btn-primary" id="btn-create-confirm">Create</button>
+    </main>
+  </div>
+
+  <script>
+    document.getElementById('sidebarMinimizer').addEventListener('click', () => {
+      document.body.classList.toggle('sidebar-minimized');
+      document.body.classList.toggle('brand-minimized');
+    });
+    const isMobile = () => window.matchMedia('(max-width: 767.98px)').matches;
+    document.getElementById('sidebarToggler').addEventListener('click', () => {
+      if (isMobile()) {
+        document.body.classList.toggle('sidebar-mobile-show');
+      } else {
+        document.body.classList.toggle('sidebar-hidden');
+      }
+    });
+    document.querySelectorAll('#main-nav .nav-link').forEach(link => {
+      link.addEventListener('click', e => {
+        e.preventDefault();
+        document.querySelectorAll('#main-nav .nav-link').forEach(l => l.classList.remove('active'));
+        link.classList.add('active');
+        const target = link.dataset.section;
+        document.querySelectorAll('.app-section').forEach(s => s.style.display = 'none');
+        document.getElementById('section-' + target).style.display = '';
+        if (isMobile()) document.body.classList.remove('sidebar-mobile-show');
+      });
+    });
+  </script>
+
+  <!-- ===== TABLE MANAGER MODALS ===== -->
+
+  <!-- Create table -->
+  <div class="modal fade" id="modal-create" tabindex="-1" role="dialog">
+    <div class="modal-dialog" role="document">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">New Correction Table</h5>
+          <button type="button" class="close" data-dismiss="modal"><span>&times;</span></button>
+        </div>
+        <div class="modal-body">
+          <table class="table table-sm table-borderless">
+            <tbody>
+              <tr><td>Name</td><td><input type="text" id="create-name" class="form-control form-control-sm" placeholder="e.g. table-2026" style="width:180px"></td></tr>
+              <tr>
+                <td>2nd Dimension Mode</td>
+                <td>
+                  <select id="create-mode" class="form-select form-select-sm" style="width:180px">
+                    <option value="twa" selected>TWA (True Wind Angle)</option>
+                    <option value="heel">Heel Angle (Roll)</option>
+                  </select>
+                </td>
+              </tr>
+              <tr><td id="create-maxSpeed-label">Max speed (kn)</td><td><input type="number" id="create-maxSpeed" class="form-control form-control-sm" value="9" min="1" max="30" step="1" style="width:80px"></td></tr>
+              <tr><td id="create-speedStep-label">Speed step (kn)</td><td><input type="number" id="create-speedStep" class="form-control form-control-sm" value="1" min="0.1" max="5" step="0.1" style="width:80px"></td></tr>
+              <tr id="row-create-maxDim2" style="display:none"><td id="create-maxHeel-label">Max heel (&deg;)</td><td><input type="number" id="create-maxHeel" class="form-control form-control-sm" value="32" min="1" max="90" step="1" style="width:80px"></td></tr>
+              <tr id="row-create-dim2Step" style="display:none"><td id="create-heelStep-label">Heel step (&deg;)</td><td><input type="number" id="create-heelStep" class="form-control form-control-sm" value="8" min="1" max="30" step="1" style="width:80px"></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="modal-footer">
+          <span id="modal-create-status" class="small text-danger mr-auto"></span>
+          <button type="button" class="btn btn-secondary" data-dismiss="modal">Cancel</button>
+          <button type="button" class="btn btn-primary" id="btn-create-confirm">Create</button>
+        </div>
       </div>
     </div>
   </div>
-</div>
+
+  <!-- Load table -->
+  <div class="modal fade" id="modal-load" tabindex="-1" role="dialog">
+    <div class="modal-dialog" role="document">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">Load Correction Table</h5>
+          <button type="button" class="close" data-dismiss="modal"><span>&times;</span></button>
+        </div>
+        <div class="modal-body">
+          <p class="text-muted small">Select a saved table to load and activate.</p>
+          <ul id="table-list" class="list-group"></ul>
+        </div>
+        <div class="modal-footer">
+          <span id="modal-load-status" class="small text-danger mr-auto"></span>
+          <button type="button" class="btn btn-secondary" data-dismiss="modal">Cancel</button>
+          <button type="button" class="btn btn-primary" id="btn-load-confirm" disabled>Load</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Copy table -->
+  <div class="modal fade" id="modal-copy" tabindex="-1" role="dialog">
+    <div class="modal-dialog" role="document">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">Copy Active Table</h5>
+          <button type="button" class="close" data-dismiss="modal"><span>&times;</span></button>
+        </div>
+        <div class="modal-body">
+          <p class="text-muted small">Save the active table under a new name and activate it.</p>
+          <table class="table table-sm table-borderless">
+            <tbody>
+              <tr><td>New name</td><td><input type="text" id="copy-name" class="form-control form-control-sm" placeholder="e.g. backup-2026" style="width:180px"></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="modal-footer">
+          <span id="modal-copy-status" class="small text-danger mr-auto"></span>
+          <button type="button" class="btn btn-secondary" data-dismiss="modal">Cancel</button>
+          <button type="button" class="btn btn-primary" id="btn-copy-confirm">Copy</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Resize table -->
+  <div class="modal fade" id="modal-resize" tabindex="-1" role="dialog">
+    <div class="modal-dialog" role="document">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">Resize Active Table</h5>
+          <button type="button" class="close" data-dismiss="modal"><span>&times;</span></button>
+        </div>
+        <div class="modal-body">
+          <p class="text-muted small">Resamples learned corrections onto a new grid. The active table file is overwritten.</p>
+          <table class="table table-sm table-borderless">
+            <tbody>
+              <tr><td id="resize-maxSpeed-label">Max speed (kn)</td><td><input type="number" id="resize-maxSpeed" class="form-control form-control-sm" min="1" max="30" step="1" style="width:80px"></td></tr>
+              <tr><td id="resize-speedStep-label">Speed step (kn)</td><td><input type="number" id="resize-speedStep" class="form-control form-control-sm" min="0.1" max="5" step="0.1" style="width:80px"></td></tr>
+              <tr><td id="resize-maxHeel-label">Max heel (&deg;)</td><td><input type="number" id="resize-maxHeel" class="form-control form-control-sm" min="1" max="90" step="1" style="width:80px"></td></tr>
+              <tr><td id="resize-heelStep-label">Heel step (&deg;)</td><td><input type="number" id="resize-heelStep" class="form-control form-control-sm" min="1" max="30" step="1" style="width:80px"></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="modal-footer">
+          <span id="modal-resize-status" class="small mr-auto"></span>
+          <button type="button" class="btn btn-secondary" data-dismiss="modal">Cancel</button>
+          <button type="button" class="btn btn-primary" id="btn-resize-confirm">Resize</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="app.js"></script>
+
+</body>
+
+</html>
