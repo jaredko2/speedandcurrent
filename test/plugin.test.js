@@ -689,4 +689,101 @@ describe('truewindangle (TWA) correction table', () => {
       cleanup();
     }
   });
+
+  describe('TableRenderer column labelling (upwind/reaching/downwind)', () => {
+    let TableRenderer;
+
+    before(async () => {
+      class MockEl {
+        constructor(tag) {
+          this.tagName = tag.toUpperCase();
+          this.children = [];
+          this.classList = { add: (...cls) => this.classes.push(...cls) };
+          this.classes = [];
+          this.style = {};
+        }
+        appendChild(child) { this.children.push(child); return child; }
+      }
+      global.document = {
+        createElement: (tag) => new MockEl(tag)
+      };
+      const mod = await import('../public/TableRenderer.js');
+      TableRenderer = mod.default;
+    });
+
+    it('renders sector labels (Upwind, Reaching, Downwind) on heel correction tables', () => {
+      const renderer = new TableRenderer();
+      const heelData = {
+        id: 'correctionTable',
+        dimensionTwoMode: 'heel',
+        row: { min: 0, max: 2, step: 1 },
+        col: { min: -0.5585, max: 0.5585, step: 0.1396 },
+        table: [[{}, {}, {}, {}, {}, {}, {}, {}, {}]]
+      };
+
+      const tableEl = renderer.render(heelData);
+      assert.strictEqual(tableEl.tagName, 'TABLE');
+
+      const thead = tableEl.children[0];
+      assert.strictEqual(thead.tagName, 'THEAD');
+      assert.strictEqual(thead.children.length, 2);
+
+      const [rowSectors, rowAngles] = thead.children;
+
+      // First row contains corner cell plus grouped sectors
+      const sectorLabels = rowSectors.children.map(c => c.textContent);
+      assert.deepStrictEqual(sectorLabels, [
+        'kn / °',
+        'Port Upwind',
+        'Port Reaching',
+        'Downwind',
+        'Stbd Reaching',
+        'Stbd Upwind'
+      ]);
+
+      // Downwind, Reaching, and Upwind sectors are present
+      assert.ok(sectorLabels.includes('Downwind'));
+      assert.ok(sectorLabels.includes('Port Reaching'));
+      assert.ok(sectorLabels.includes('Port Upwind'));
+      assert.ok(sectorLabels.includes('Stbd Reaching'));
+      assert.ok(sectorLabels.includes('Stbd Upwind'));
+
+      // Colspans cover all 9 columns
+      const sectorColspans = rowSectors.children.slice(1).map(c => c.colSpan);
+      assert.strictEqual(sectorColspans.reduce((a, b) => a + b, 0), 9);
+
+      // Angle row contains individual heel angle labels
+      const angles = rowAngles.children.map(c => c.textContent);
+      assert.deepStrictEqual(angles, ['-32', '-24', '-16', '-8', '0', '8', '16', '24', '32']);
+    });
+
+    it('renders sector labels (Upwind, Reaching, Downwind) on TWA correction tables', () => {
+      const renderer = new TableRenderer();
+      const twaData = {
+        id: 'twaTable',
+        dimensionTwoMode: 'twa',
+        row: { min: 0, max: 2, step: 1 },
+        col: { bins: [-145, -90, -40, 40, 90, 145].map(d => d * Math.PI / 180) },
+        table: [[{}, {}, {}, {}, {}, {}]]
+      };
+
+      const tableEl = renderer.render(twaData);
+      const thead = tableEl.children[0];
+      const [rowSectors, rowAngles] = thead.children;
+
+      const sectorLabels = rowSectors.children.map(c => c.textContent);
+      assert.deepStrictEqual(sectorLabels, [
+        'kn / TWA',
+        'Port Downwind',
+        'Port Reaching',
+        'Port Upwind',
+        'Stbd Upwind',
+        'Stbd Reaching',
+        'Stbd Downwind'
+      ]);
+
+      const angles = rowAngles.children.map(c => c.textContent);
+      assert.deepStrictEqual(angles, ['>120°', '60°–120°', '<60°', '<60°', '60°–120°', '>120°']);
+    });
+  });
 });

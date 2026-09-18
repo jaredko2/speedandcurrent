@@ -54,6 +54,20 @@
   font-size: 11px;
 }
 
+.TableSectorHeader {
+  min-width: 60px;
+  padding: 4px 2px;
+  text-align: center;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #495057;
+  background-color: #f1f3f5;
+  border-bottom: 1px solid #ced4da;
+  white-space: nowrap;
+}
+
 .TableRowHeader {
   padding: 4px 8px;
   text-align: right;
@@ -67,6 +81,7 @@
   font-weight: 400; 
   text-align: center;
   padding: 4px 8px;
+  vertical-align: middle;
 }
 
 /* Cell states */

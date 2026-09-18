@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+- Restored and enhanced sector labelling (Upwind, Reaching, Downwind) on correction table column headers for both Heel angle and True Wind Angle (TWA) modes.
+
+
 ## [2.3.3] - 2026-09-06
 
 ### Fixed
