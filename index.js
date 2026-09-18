@@ -39,6 +39,10 @@ function isCogOverrideActive(groundSpeedPolar, speedThreshold) {
     && sogHandler.value < speedThreshold;
 }
 
+/**
+ * Leeway is the angle of the corrected boatspeed vector, so a small lateral
+ * correction divided by a near-zero magnitude yields a large, meaningless angle.
+ */
 function isLeewayValid(speed, speedThreshold, navigationStateHandler) {
   if (!(speed >= speedThreshold)) return false;
   const state = navigationStateHandler?.state;
@@ -166,6 +170,7 @@ module.exports = function (app) {
   function readOptions() {
     const stored = app.readPluginOptions();
     const raw = stored && stored.configuration ? stored.configuration : (stored || {});
+    // Strip embedded table — stored separately on disk
     const { correctionTable: _drop, ...rest } = raw;
     options = { ...defaultOptions, ...rest };
   }
@@ -181,6 +186,10 @@ module.exports = function (app) {
     saveOptions();
   }
 
+  /**
+   * Strips obsolete source-selection fields from the persisted config and
+   * writes it back if anything changed. Called once on every start().
+   */
   function migrateConfig() {
     const obsoleteKeys = ['headingSource', 'boatSpeedSource', 'SOGSource', 'attitudeSource', 'preventDuplication', 'minSogForLearning'];
     const hadObsolete = obsoleteKeys.some(k => k in options);
@@ -192,6 +201,9 @@ module.exports = function (app) {
     }
   }
 
+  /**
+   * Derives { SmootherClass, smootherOptions } from the current options.
+   */
   function resolveSmootherConfig() {
     const cls = options.smootherClass || 'MovingAverageSmoother';
     if (cls === 'ExponentialSmoother') {
@@ -215,7 +227,7 @@ module.exports = function (app) {
 
   function swapTable(newTable) {
     table = newTable;
-    minSpeed = table.step[0];
+    minSpeed = (table.step && Number.isFinite(table.step[0])) ? table.step[0] : (table.row?.step ?? 0.5144);
     if (reportFull) reportFull.setTables([table]);
     lastSave = Date.now();
   }
@@ -224,6 +236,7 @@ module.exports = function (app) {
   let pluginStatus = 'Stopped';
   let smoothedHeading = null;
   let smoothedAttitude = null;
+  let smoothedTwa = null;
   let rawCurrent = null;
   let smoothedCurrent = null;
   let smoothedBoatSpeed = null;
@@ -239,6 +252,7 @@ module.exports = function (app) {
 
   let rawHeading = null;
   let rawAttitude = null;
+  let rawTwa = null;
   let noCurrent = null;
   let rawBoatSpeed = null;
   let rawGroundSpeed = null;
@@ -252,9 +266,6 @@ module.exports = function (app) {
   let lastObservationReason = null;
   let lifecycleWarningMap = new Map();
   let lifecycleWarnings = [];
-
-  // Handler for True Wind Angle (TWA)
-  let smoothedTwa = null;
 
   function setObservationStatus(state, reason = null) {
     lastObservationState = state;
@@ -310,6 +321,8 @@ module.exports = function (app) {
     const safePath = path || 'unknown path';
     const message = status === 'idle'
       ? `Input ${id} is idle on ${safePath}; resubscribing`
+      : status === 'incomplete'
+      ? `Input ${id} is missing ${safePath}`
       : `Input ${id} is stale on ${safePath}`;
     lifecycleWarningMap.set(id, {
       id,
@@ -392,6 +405,7 @@ module.exports = function (app) {
       res.json({ status: pluginStatus, isRunning, lifecycleWarnings, learningState: getLearningStatePayload() });
     });
 
+    // --- Settings API ---
     router.get('/api/settings', (req, res) => {
       res.json({ ...options, ...changedOptions });
     });
@@ -401,6 +415,7 @@ module.exports = function (app) {
       if (!body || typeof body !== 'object') {
         return res.status(400).json({ error: 'JSON body required' });
       }
+      // Reject keys managed by the table manager
       const blocked = ['correctionTable', 'tableName'];
       for (const k of blocked) {
         if (k in body) {
@@ -411,6 +426,9 @@ module.exports = function (app) {
       res.json({ ...options, ...changedOptions });
     });
 
+    // --- Correction Table Manager API ---
+
+    // List all table files in dataDir
     router.get('/api/tables', (req, res) => {
       const dataDir = app.getDataDirPath();
       let files;
@@ -421,50 +439,46 @@ module.exports = function (app) {
       for (const file of files) {
         try {
           const data = Table2D.readFromFile(path.join(dataDir, file));
-          if (data && data.row && data.col && Array.isArray(data.table)) {
+          if (data && Array.isArray(data.table) && data.table.length > 0) {
             const name = file.replace(/\.json$/, '');
-            tables.push({ name, active: name === activeName });
+            const dimensionTwoMode = data.dimensionTwoMode || (data.table[0]?.length === 6 ? 'twa' : 'heel');
+            tables.push({ name, active: name === activeName, dimensionTwoMode });
           }
         } catch (e) { /* skip non-table files */ }
       }
       res.json(tables);
     });
 
+    // Create a new table and hot-swap it
     router.post('/api/tables/create', (req, res) => {
       const body = req.body || {};
       const name = (body.name || '').trim();
-      const mode = body.dimensionTwoMode || 'twa';
-
-      if (!name || !/^[\w-]+$/.test(name))
+      if (!name || !/^[\w-]+$/.test(name)) {
         return res.status(400).json({ error: 'Name must be alphanumeric (underscores and hyphens allowed)' });
+      }
+      const mode = body.dimensionTwoMode === 'twa' ? 'twa' : 'heel';
 
-      const rawMaxSpd = Number.isFinite(body.maxSpeed) && body.maxSpeed > 0 ? body.maxSpeed : DEFAULT_DIMS.maxSpeed;
-      const rawSpdStep = Number.isFinite(body.speedStep) && body.speedStep > 0 ? body.speedStep : DEFAULT_DIMS.speedStep;
+      if (!Number.isFinite(body.maxSpeed) || body.maxSpeed <= 0 ||
+          !Number.isFinite(body.speedStep) || body.speedStep <= 0) {
+        return res.status(400).json({ error: 'Invalid or missing speed dimensions' });
+      }
 
-      const row = {
-        min: 0,
-        max: rawMaxSpd,
-        step: rawSpdStep
-      };
-
+      const row = { min: 0, max: body.maxSpeed, step: body.speedStep };
       let col;
       if (mode === 'twa') {
-        const degBins = [-145, -90, -40, 40, 90, 145];
+        const DEFAULT_TWA_BINS = [-145, -90, -40, 40, 90, 145].map(d => d * (Math.PI / 180));
         col = {
-          min: SI.fromDegrees(-145),
-          max: SI.fromDegrees(145),
-          step: SI.fromDegrees(58),
-          bins: degBins.map(d => SI.fromDegrees(d))
+          min: DEFAULT_TWA_BINS[0],
+          max: DEFAULT_TWA_BINS[5],
+          step: (DEFAULT_TWA_BINS[5] - DEFAULT_TWA_BINS[0]) / 5,
+          bins: DEFAULT_TWA_BINS
         };
       } else {
-        const rawMaxHeel = Number.isFinite(body.maxDim2 || body.maxHeel) ? (body.maxDim2 || body.maxHeel) : DEFAULT_DIMS.maxHeel;
-        const rawHeelStep = Number.isFinite(body.dim2Step || body.heelStep) ? (body.dim2Step || body.heelStep) : DEFAULT_DIMS.heelStep;
-
-        col = {
-          min: -SI.fromDegrees(rawMaxHeel),
-          max: SI.fromDegrees(rawMaxHeel),
-          step: SI.fromDegrees(rawHeelStep)
-        };
+        if (!Number.isFinite(body.maxHeel) || body.maxHeel <= 0 ||
+            !Number.isFinite(body.heelStep) || body.heelStep <= 0) {
+          return res.status(400).json({ error: 'Invalid or missing heel dimensions' });
+        }
+        col = { min: -body.maxHeel, max: body.maxHeel, step: body.heelStep };
       }
 
       const newTable = new CorrectionTable(name, row, col, options.stability || 7, mode);
@@ -472,55 +486,73 @@ module.exports = function (app) {
       saveTable(newTable, path.join(app.getDataDirPath(), name + '.json'));
       if (isRunning) swapTable(newTable);
       saveTableName(name);
-      res.json({ name });
+      res.json({ name, dimensionTwoMode: mode });
     });
 
+    // Load a saved table and make it active
     router.post('/api/tables/load', (req, res) => {
       const body = req.body || {};
       const name = (body.name || '').trim();
-      if (!name || !/^[\w-]+$/.test(name))
+      if (!name || !/^[\w-]+$/.test(name)) {
         return res.status(400).json({ error: 'Invalid table name' });
+      }
       const filePath = path.join(app.getDataDirPath(), name + '.json');
       const fileData = Table2D.readFromFile(filePath);
       if (!fileData) return res.status(404).json({ error: `Table '${name}' not found` });
       const loadedTable = CorrectionTable.fromJSON(fileData, options.stability || 7);
+      if (!loadedTable) return res.status(400).json({ error: `Could not parse table '${name}'` });
       loadedTable.setDisplayAttributes({ label: name });
+      // Ensure file on disk reflects any standardized format
+      saveTableSync(loadedTable, filePath);
       if (isRunning) swapTable(loadedTable);
       saveTableName(name);
-      res.json({ name });
+      res.json({ name, dimensionTwoMode: loadedTable.dimensionTwoMode });
     });
 
+    // Copy active table under a new name and hot-swap to it
     router.post('/api/tables/copy', (req, res) => {
       if (!isRunning || !table) return res.status(503).json({ error: 'Plugin is not running' });
       const body = req.body || {};
       const newName = (body.newName || '').trim();
-      if (!newName || !/^[\w-]+$/.test(newName))
+      if (!newName || !/^[\w-]+$/.test(newName)) {
         return res.status(400).json({ error: 'Name must be alphanumeric (underscores and hyphens allowed)' });
+      }
       const data = table.toJSON();
       data.id = newName;
       const copiedTable = CorrectionTable.fromJSON(data, options.stability || 7);
       copiedTable.setDisplayAttributes({ label: newName });
-      saveTable(copiedTable, path.join(app.getDataDirPath(), newName + '.json'));
+      saveTableSync(copiedTable, path.join(app.getDataDirPath(), newName + '.json'));
       swapTable(copiedTable);
       saveTableName(newName);
-      res.json({ name: newName });
+      res.json({ name: newName, dimensionTwoMode: copiedTable.dimensionTwoMode });
     });
 
+    // Resize the active table (resamples onto new grid, preserves name)
     router.post('/api/tables/resize', (req, res) => {
       if (!isRunning || !table) return res.status(503).json({ error: 'Plugin is not running' });
       const body = req.body || {};
-      const dims = ['maxSpeed', 'speedStep', 'maxHeel', 'heelStep'];
-      for (const f of dims) {
-        if (!Number.isFinite(body[f]) || body[f] <= 0)
-          return res.status(400).json({ error: `Invalid or missing field: ${f}` });
+      if (!Number.isFinite(body.maxSpeed) || body.maxSpeed <= 0 ||
+          !Number.isFinite(body.speedStep) || body.speedStep <= 0) {
+        return res.status(400).json({ error: 'Speed dimensions must be positive numbers' });
       }
+
       const newRow = { min: 0, max: body.maxSpeed, step: body.speedStep };
-      const newCol = { min: -SI.fromDegrees(body.maxHeel), max: SI.fromDegrees(body.maxHeel), step: SI.fromDegrees(body.heelStep) };
-      const resized = CorrectionTable.resampleFromJSON(table.toJSON(), newRow, newCol, options.stability || 7, 1e-4);
+      let newCol;
+      if (table.dimensionTwoMode === 'twa') {
+        newCol = table.col;
+      } else {
+        if (!Number.isFinite(body.maxHeel) || body.maxHeel <= 0 ||
+            !Number.isFinite(body.heelStep) || body.heelStep <= 0) {
+          return res.status(400).json({ error: 'Heel dimensions must be positive numbers' });
+        }
+        newCol = { min: -body.maxHeel, max: body.maxHeel, step: body.heelStep };
+      }
+
+      const resized = CorrectionTable.resample(table, newRow, newCol, options.stability || 7, 1e-4);
       resized.setDisplayAttributes({ label: resized.id });
-      saveTable(resized, path.join(app.getDataDirPath(), resized.id + '.json'));
+      saveTableSync(resized, path.join(app.getDataDirPath(), resized.id + '.json'));
       swapTable(resized);
-      res.json({ name: resized.id });
+      res.json({ name: resized.id, dimensionTwoMode: resized.dimensionTwoMode });
     });
   };
 
@@ -539,10 +571,12 @@ module.exports = function (app) {
     const tableName = options.tableName || 'correctionTable';
     const tableFilePath = path.join(app.getDataDirPath(), tableName + '.json');
     table = loadTable(options, tableFilePath);
-    minSpeed = table.step[0];
+    minSpeed = (table.step && Number.isFinite(table.step[0])) ? table.step[0] : (table.row?.step ?? 0.5144);
 
+    //#region Handler and Polar Initialization
     const { SmootherClass, smootherOptions } = resolveSmootherConfig();
 
+    // heading
     smoothedHeading = new SmoothedAngle(app, plugin.id, 'heading', 'navigation.headingTrue', {
       angleRange: '0to2pi',
       meta: { displayName: 'Heading', plane: 'Ground' },
@@ -556,6 +590,7 @@ module.exports = function (app) {
     });
     rawHeading = smoothedHeading.handler;
 
+    // attitude (heel)
     smoothedAttitude = createSmoothedHandler({
       app, pluginId: plugin.id,
       id: 'attitude',
@@ -571,7 +606,7 @@ module.exports = function (app) {
     });
     rawAttitude = smoothedAttitude.handler;
 
-    // True Wind Angle handler for TWA-mode table updating
+    // True wind angle (for catamarans)
     smoothedTwa = new SmoothedAngle(app, plugin.id, 'twa', 'environment.wind.angleTrueWater', {
       angleRange: '-piToPi',
       meta: { displayName: 'True Wind Angle', plane: 'Boat' },
@@ -583,6 +618,7 @@ module.exports = function (app) {
         () => { smoothedTwa?.unsubscribe(); smoothedTwa?.subscribe(false, true); }
       )
     });
+    rawTwa = smoothedTwa.handler;
 
     navigationStateHandler = new MessageHandler(app, plugin.id, 'navigationState');
     navigationStateHandler.configure('navigation.state');
@@ -591,7 +627,8 @@ module.exports = function (app) {
     };
     navigationStateHandler.subscribe();
 
-    MessageHandler.setMeta(app, plugin.id, "environment.current.drift", {units: "m/s", type: "number", description: "Speed of the current"});
+    // current
+    MessageHandler.setMeta(app, plugin.id, "environment.current.drift", { units: "m/s", type: "number", description: "Speed of the current" });
     MessageHandler.setMeta(app, plugin.id, "environment.current.setTrue", { units: "rad", type: "number", description: "Direction of the current" });
     rawCurrent = new Polar(app, plugin.id, "current");
     rawCurrent.configureMagnitude("environment.current.drift");
@@ -615,8 +652,8 @@ module.exports = function (app) {
       smootherOptions: smootherOptions,
       meta: { displayName: "NoCurrent", plane: "Ground" },
     });
-    noCurrent.xSmoother.reset(0,0);
-    noCurrent.ySmoother.reset(0,0);
+    noCurrent.xSmoother.reset(0, 0);
+    noCurrent.ySmoother.reset(0, 0);
     PolarSmoother.send(app, plugin.id, [noCurrent]);
 
     MessageHandler.setMeta(app, plugin.id, 'navigation.leewayAngle', {
@@ -627,11 +664,12 @@ module.exports = function (app) {
       }
     });
 
+    // boatspeed
     smoothedBoatSpeed = createSmoothedHandler({
       app, pluginId: plugin.id,
       id: 'boatSpeed',
       path: 'navigation.speedThroughWater',
-      subscribe: true,
+      subscribe: false,
       SmootherClass,
       smootherOptions,
       onDelta: () => {
@@ -646,7 +684,7 @@ module.exports = function (app) {
           now: Date.now()
         });
 
-        const wellUnderway = learningMode.state !== 'stabilizing';
+        const wellUnderway = Date.now() >= learningStabilizingUntil;
         setStatus(learningMode.state === 'stabilizing' ? 'Stabilizing' : 'Running');
         if (options.estimateBoatSpeed) correct(wellUnderway);
         updateTable();
@@ -677,6 +715,7 @@ module.exports = function (app) {
     });
     rawBoatSpeed = smoothedBoatSpeed.handler;
 
+    // Learning polar
     lrnBoatSpeed = new Polar(app, plugin.id, "lrnBoatSpeed");
     lrnBoatSpeed.configureMagnitude("navigation.speedThroughWater");
     lrnBoatSpeed.configureAngle("navigation.leewayAngle");
@@ -691,6 +730,7 @@ module.exports = function (app) {
     boatSpeedRefGround = new Polar(app, plugin.id, "boatSpeedRefGround");
     boatSpeedRefGround.setMeta({ displayName: "Boat speed over ground", plane: "Ground" });
 
+    // ground speed
     smoothedGroundSpeed = createSmoothedPolar({
       app, pluginId: plugin.id,
       id: 'groundSpeed',
@@ -715,12 +755,15 @@ module.exports = function (app) {
     residual.setMeta({ displayName: "Residual", plane: "Ground" });
     smoothedResidual = new PolarSmoother(residual, ExponentialSmoother, { tau: 30, timeSpan: 30 });
     smoothedResidual.setAngleRange('0to2pi');
+    //#endregion
 
+    //#region Reporting
     reportFull = new Reporter();
 
     if (options.estimateBoatSpeed) {
       reportFull.addDelta(rawHeading);
       reportFull.addAttitude(rawAttitude);
+      if (rawTwa) reportFull.addDelta(rawTwa);
       reportFull.addDelta(rawBoatSpeed);
       reportFull.addPolar(speedCorrection);
       reportFull.addPolar(boatSpeedRefGround);
@@ -730,16 +773,16 @@ module.exports = function (app) {
       reportFull.addPolar(residual);
       reportFull.addPolar(smoothedResidual);
     }
-
     reportFull.addDelta(smoothedHeading);
     reportFull.addAttitude(smoothedAttitude);
+    if (smoothedTwa) reportFull.addDelta(smoothedTwa);
     reportFull.addDelta(smoothedBoatSpeed);
     reportFull.addPolar(smoothedGroundSpeed);
-
     if (options.assumeCurrent && !options.estimateBoatSpeed) {
       reportFull.addPolar(smoothedCurrent);
     }
     reportFull.addTable(table);
+    //#endregion
 
     isRunning = true;
     lastSave = 0;
@@ -748,6 +791,7 @@ module.exports = function (app) {
     lastNavigationStateValue = normalizeNavigationState(navigationStateHandler?.value);
     resetLearningStabilization('startup', LONG_STABILIZING_MS);
     setStatus('Running');
+    smoothedBoatSpeed.subscribe();
     app.debug("Running");
   };
 
@@ -777,6 +821,7 @@ module.exports = function (app) {
         table = null;
         rawHeading = null;
         rawAttitude = null;
+        rawTwa = null;
         noCurrent = null;
         rawBoatSpeed = null;
         rawGroundSpeed = null;
@@ -799,20 +844,29 @@ module.exports = function (app) {
     });
   };
 
+  /**
+   * Corrects and publishes boat speed.
+   */
   function correct(wellUnderway) {
-    correctedBoatSpeed.setVectorValue({ x: rawBoatSpeed.value, y: 0 }); 
+    correctedBoatSpeed.setVectorValue({ x: rawBoatSpeed.value, y: 0 });
     speedCorrection.setVectorValue({ x: 0, y: 0 });
 
-    if (options.sogFallback && rawGroundSpeed.ready && rawBoatSpeed.ready && rawBoatSpeed.value === 0 && rawGroundSpeed.magnitude >= minSpeed) {
-        correctedBoatSpeed.setVectorValue({ x: rawGroundSpeed.magnitude, y: 0 });
-    }
-    else if (rawAttitude.ready) {
-      if (correctedBoatSpeed.magnitude > 0) {
-        const dim2Val = (table?.dimensionTwoMode === 'twa') 
-          ? (smoothedTwa?.handler?.value ?? 0)
-          : (rawAttitude.value?.roll ?? 0);
+    const isTwa = table?.dimensionTwoMode === 'twa';
+    const dim2Ready = isTwa
+      ? Boolean(smoothedTwa && (smoothedTwa.ready || smoothedTwa.handler?.ready))
+      : Boolean(rawAttitude && rawAttitude.ready && Number.isFinite(rawAttitude.value?.roll));
 
-        const { correction, variance } = table.getCorrection(correctedBoatSpeed.magnitude, dim2Val) || { correction: { x: 0, y: 0 }, variance: { x: 0, y: 0 } };
+    if (options.sogFallback && rawGroundSpeed.ready && rawBoatSpeed.ready && rawBoatSpeed.value === 0 && rawGroundSpeed.magnitude >= minSpeed) {
+      correctedBoatSpeed.setVectorValue({ x: rawGroundSpeed.magnitude, y: 0 });
+    }
+    else if (dim2Ready) {
+      if (!isTwa) clearLifecycleWarning('attitude.roll');
+      if (correctedBoatSpeed.magnitude > 0) {
+        const dim2Val = isTwa
+          ? (smoothedTwa?.handler?.value ?? smoothedTwa?.value ?? 0)
+          : rawAttitude.value.roll;
+        const { correction, variance } = table.getCorrection(correctedBoatSpeed.magnitude, dim2Val)
+          || { correction: { x: 0, y: 0 }, variance: { x: 0, y: 0 } };
         const leewayValid = isLeewayValid(correctedBoatSpeed.magnitude, minSpeed, navigationStateHandler);
         speedCorrection.setVectorValue(
           { x: correction.x || 0, y: leewayValid ? (correction.y || 0) : 0 },
@@ -841,11 +895,17 @@ module.exports = function (app) {
         }
       }
     }
+    else if (!isTwa && rawAttitude?.ready) {
+      setLifecycleWarning('attitude.roll', 'incomplete', 'navigation.attitude.roll');
+    }
 
     PolarSmoother.send(app, plugin.id, [smoothedCurrent, smoothedResidual]);
     Polar.send(app, plugin.id, [correctedBoatSpeed]);
   }
 
+  /**
+   * Updates the correction table from current smoothed inputs.
+   */
   function updateTable() {
     lrnBoatSpeed.setVectorValue({ x: smoothedBoatSpeed.value, y: 0 }, { x: smoothedBoatSpeed.variance ?? 0, y: 0 });
     const learningMode = evaluateLearningMode({
@@ -859,7 +919,13 @@ module.exports = function (app) {
       learningMode.state = 'suspended';
       learningMode.reason = 'cog_override';
     }
-    const inputsReady = smoothedAttitude.ready && smoothedBoatSpeed.ready && smoothedHeading.ready && smoothedGroundSpeed.ready;
+
+    const isTwa = table?.dimensionTwoMode === 'twa';
+    const dim2Ready = isTwa
+      ? Boolean(smoothedTwa && (smoothedTwa.ready || smoothedTwa.handler?.ready))
+      : Boolean(smoothedAttitude && smoothedAttitude.ready && Number.isFinite(smoothedAttitude.value?.roll));
+
+    const inputsReady = dim2Ready && smoothedBoatSpeed.ready && smoothedHeading.ready && smoothedGroundSpeed.ready;
     const currentReady = !options.assumeCurrent || smoothedCurrent.ready;
     const observationGate = evaluateObservationGate({
       learningMode,
@@ -873,15 +939,15 @@ module.exports = function (app) {
 
     if (observationGate.state !== 'pending') {
       if (observationGate.state === 'invalid') {
+        setObservationStatus('rejected', observationGate.reason);
         resetLearningStabilization('observation_reset', getShortStabilizingMs(options));
       }
       return;
     }
 
-    // Select second dimension value: TWA when in TWA mode, Heel when in Heel mode
-    const dim2Val = (table?.dimensionTwoMode === 'twa') 
-      ? (smoothedTwa?.handler?.value ?? 0)
-      : (smoothedAttitude.value?.roll ?? 0);
+    const dim2Val = isTwa
+      ? (smoothedTwa?.handler?.value ?? smoothedTwa?.value ?? 0)
+      : smoothedAttitude.value.roll;
 
     table.update(smoothedBoatSpeed.value, dim2Val, smoothedGroundSpeed, options.assumeCurrent ? smoothedCurrent : noCurrent, lrnBoatSpeed, smoothedHeading.value);
     if (table.lastUpdateResult === 'accepted') {
@@ -908,15 +974,11 @@ module.exports = function (app) {
       } else {
         app.error(`Correction table retry failed — starting with empty table. Disk file preserved: ${filePath}`);
         const name = options.tableName || 'correctionTable';
-        const row = { min: 0, max: DEFAULT_DIMS.maxSpeed, step: DEFAULT_DIMS.speedStep };
-        const col = { min: -SI.fromDegrees(DEFAULT_DIMS.maxHeel), max: SI.fromDegrees(DEFAULT_DIMS.maxHeel), step: SI.fromDegrees(DEFAULT_DIMS.heelStep) };
-        table = new CorrectionTable(name, row, col, stability);
+        table = CorrectionTable.createDefault(name, 'heel', stability);
       }
     } else {
       const name = options.tableName || 'correctionTable';
-      const row = { min: 0, max: DEFAULT_DIMS.maxSpeed, step: DEFAULT_DIMS.speedStep };
-      const col = { min: -SI.fromDegrees(DEFAULT_DIMS.maxHeel), max: SI.fromDegrees(DEFAULT_DIMS.maxHeel), step: SI.fromDegrees(DEFAULT_DIMS.heelStep) };
-      table = new CorrectionTable(name, row, col, stability);
+      table = CorrectionTable.createDefault(name, 'heel', stability);
       app.debug("Correction table created: " + name);
     }
     table.setDisplayAttributes({ label: table.id });
@@ -958,7 +1020,7 @@ module.exports = function (app) {
             reloaded.setDisplayAttributes({ label: reloaded.id });
             if (!isTableEmpty(reloaded)) {
               swapTable(reloaded);
-              app.debug('Correction table reloaded from disk: learning switched on (was empty in memory)');
+              app.debug('Correction table reloaded from disk: learning switched on');
             }
           }
         }
@@ -975,7 +1037,7 @@ module.exports = function (app) {
     if (changedKeys.some(k => SMOOTHER_KEYS.includes(k))) {
       const { SmootherClass: SC, smootherOptions: so } = resolveSmootherConfig();
       for (const s of [smoothedHeading, smoothedBoatSpeed, smoothedGroundSpeed, smoothedTwa]) {
-        if (s && s.setSmootherClass) { s.setSmootherClass(SC); s.setSmootherOptions(so); }
+        if (s) { s.setSmootherClass(SC); s.setSmootherOptions(so); }
       }
       if (smoothedAttitude) { smoothedAttitude.setSmootherClass(SC); smoothedAttitude.setSmootherOptions(so); }
     }

@@ -553,3 +553,140 @@ describe('plugin lifecycle', () => {
     }
   });
 });
+
+describe('truewindangle (TWA) correction table', () => {
+  const { CorrectionTable } = require('../correctionTable.js');
+
+  it('CorrectionTable.fromJSON correctly loads existing TWA table and reconstructs row, col, and bins', () => {
+    // Existing data format where dimensionTwoMode is twa or has 6 columns
+    const rawData = {
+      id: 'catamaran-twa',
+      dimensionTwoMode: 'twa',
+      table: [
+        [
+          { x: 0.05, y: 0.01, variance: { x: 0.01, y: 0.01 } },
+          { x: 0.06, y: 0.02, variance: { x: 0.01, y: 0.01 } },
+          { x: 0.04, y: 0.01, variance: { x: 0.01, y: 0.01 } },
+          { x: 0.04, y: -0.01, variance: { x: 0.01, y: 0.01 } },
+          { x: 0.06, y: -0.02, variance: { x: 0.01, y: 0.01 } },
+          { x: 0.05, y: -0.01, variance: { x: 0.01, y: 0.01 } },
+        ],
+        [
+          { x: 0.08, y: 0.02, variance: { x: 0.01, y: 0.01 } },
+          { x: 0.09, y: 0.03, variance: { x: 0.01, y: 0.01 } },
+          { x: 0.07, y: 0.02, variance: { x: 0.01, y: 0.01 } },
+          { x: 0.07, y: -0.02, variance: { x: 0.01, y: 0.01 } },
+          { x: 0.09, y: -0.03, variance: { x: 0.01, y: 0.01 } },
+          { x: 0.08, y: -0.02, variance: { x: 0.01, y: 0.01 } },
+        ]
+      ]
+    };
+
+    const table = CorrectionTable.fromJSON(rawData, 7);
+    assert.ok(table, 'table should be instantiated');
+    assert.strictEqual(table.dimensionTwoMode, 'twa');
+    assert.strictEqual(table.table.length, 2);
+    assert.strictEqual(table.table[0].length, 6);
+    assert.ok(Array.isArray(table.col.bins), 'col.bins should be an array');
+    assert.strictEqual(table.col.bins.length, 6);
+
+    // Serialization retains TWA settings
+    const exported = table.toJSON();
+    assert.strictEqual(exported.dimensionTwoMode, 'twa');
+    assert.strictEqual(exported.col.bins.length, 6);
+  });
+
+  it('maps wind angles into the appropriate TWA bin', () => {
+    const deg2rad = d => (d * Math.PI) / 180;
+    const table = new CorrectionTable(
+      'twa-test',
+      { min: 0, max: 5, step: 1 },
+      {
+        min: deg2rad(-145),
+        max: deg2rad(145),
+        step: deg2rad(58),
+        bins: [-145, -90, -40, 40, 90, 145].map(deg2rad)
+      },
+      7,
+      'twa'
+    );
+
+    // Port Downwind (approx -145 deg)
+    const cellDownwindPort = table.getCell(3.0, deg2rad(-150));
+    assert.strictEqual(cellDownwindPort.c, 0);
+
+    // Port Reach (approx -90 deg)
+    const cellReachPort = table.getCell(3.0, deg2rad(-85));
+    assert.strictEqual(cellReachPort.c, 1);
+
+    // Port Upwind (approx -40 deg)
+    const cellUpwindPort = table.getCell(3.0, deg2rad(-35));
+    assert.strictEqual(cellUpwindPort.c, 2);
+
+    // Stbd Upwind (approx 40 deg)
+    const cellUpwindStbd = table.getCell(3.0, deg2rad(45));
+    assert.strictEqual(cellUpwindStbd.c, 3);
+
+    // Stbd Reach (approx 90 deg)
+    const cellReachStbd = table.getCell(3.0, deg2rad(95));
+    assert.strictEqual(cellReachStbd.c, 4);
+
+    // Stbd Downwind (approx 145 deg)
+    const cellDownwindStbd = table.getCell(3.0, deg2rad(160));
+    assert.strictEqual(cellDownwindStbd.c, 5);
+  });
+
+  it('routes list existing TWA tables with dimensionTwoMode="twa" and load successfully', async () => {
+    const { app, cleanup } = createAppShim();
+    try {
+      // Write an existing TWA table to disk
+      const twaTableContent = {
+        id: 'existing-catamaran',
+        dimensionTwoMode: 'twa',
+        table: [
+          new Array(6).fill({ x: 0.1, y: 0.02, variance: { x: 0.01, y: 0.01 } })
+        ]
+      };
+      fs.writeFileSync(
+        path.join(app.getDataDirPath(), 'existing-catamaran.json'),
+        JSON.stringify(twaTableContent, null, 2)
+      );
+
+      const plugin = require('../index.js')(app);
+      const routes = {};
+      const mockRouter = {
+        get:  (p, h) => { routes[`GET ${p}`]  = h; },
+        put:  (p, h) => { routes[`PUT ${p}`]  = h; },
+        post: (p, h) => { routes[`POST ${p}`] = h; },
+      };
+      plugin.registerWithRouter(mockRouter);
+      plugin.start();
+
+      // GET /api/tables
+      let tablesResponse = null;
+      routes['GET /api/tables']({}, { json: (d) => { tablesResponse = d; } });
+      assert.ok(Array.isArray(tablesResponse));
+      const catTable = tablesResponse.find(t => t.name === 'existing-catamaran');
+      assert.ok(catTable, 'should find existing-catamaran table in list');
+      assert.strictEqual(catTable.dimensionTwoMode, 'twa');
+
+      // POST /api/tables/load
+      let loadResponse = null;
+      let statusCode = 200;
+      routes['POST /api/tables/load'](
+        { body: { name: 'existing-catamaran' } },
+        {
+          status: (code) => { statusCode = code; return { json: (d) => { loadResponse = d; } }; },
+          json: (d) => { loadResponse = d; }
+        }
+      );
+      assert.strictEqual(statusCode, 200);
+      assert.strictEqual(loadResponse.name, 'existing-catamaran');
+      assert.strictEqual(loadResponse.dimensionTwoMode, 'twa');
+
+      await plugin.stop();
+    } finally {
+      cleanup();
+    }
+  });
+});

@@ -2,7 +2,7 @@ import TableRenderer from './TableRenderer.js';
 
 const API_BASE = '/plugins/speedandcurrent';
 
-// ─── Unit conversion ──────────────────────────────────────────────────────────
+// ─── Unit conversion (respects SK server unitPreferences via displayUnits in meta) ─
 const DEFAULTS = {
   speed: { convert: v => v * 1.943844, invert: v => v / 1.943844, symbol: 'kn', decimals: 1 },
   angle: { convert: v => v * (180 / Math.PI), invert: v => v * (Math.PI / 180), symbol: '°', decimals: 0 },
@@ -24,7 +24,7 @@ function buildConverter(displayUnits) {
   let invertFn = null;
   if (isSafeFormula(displayUnits.inverseFormula)) {
     try { invertFn = new Function('value', 'return ' + displayUnits.inverseFormula); invertFn(1); }
-    catch (e) { }
+    catch (e) { /* fall back to DEFAULTS.invert */ }
   }
   const parts = (displayUnits.displayFormat || '0.0').split('.');
   const decimals = parts.length > 1 ? parts[1].length : 0;
@@ -81,7 +81,6 @@ function normaliseState(data) {
 
 // ─── Static meta ─────────────────────────────────────────────────────────────
 let metaById = {};
-let lifecycleWarnings = [];
 
 async function loadMeta() {
   const data = await apiGet('/api/meta');
@@ -97,66 +96,108 @@ async function loadMeta() {
   applyUnitLabels();
 }
 
-function isNotReady(item) {
-  if (!item) return true;
-  return item.state?.ready !== true;
+const computedItemIds = new Set([
+  'current.smoothed', 'boatSpeedRefGround', 'speedCorrection',
+  'correctedBoatSpeed', 'residual', 'residual.smoothed'
+]);
+
+function getPathStatus(pathState, hasValue, computed = false, computedReady = false) {
+  if (computed) {
+    return hasValue && computedReady
+      ? { category: 'computed', reason: '' }
+      : { category: 'inactive', reason: 'not computed' };
+  }
+  if (pathState?.subscribed === false) {
+    return { category: 'inactive', reason: 'not subscribed' };
+  }
+  if (hasValue && pathState?.ready === true) {
+    return { category: 'subscribed', reason: '' };
+  }
+  if (!pathState) {
+    return { category: 'problem', reason: 'not available' };
+  }
+  if (pathState.pathKnown === false) {
+    return { category: 'problem', reason: 'path not found in Signal K' };
+  }
+  if (pathState.hasDelta === false) {
+    return { category: 'problem', reason: 'waiting for first data' };
+  }
+  if (pathState.isStale === true) {
+    return { category: 'problem', reason: 'data is stale' };
+  }
+  return { category: 'problem', reason: 'not available' };
 }
 
-function getNotReadyReason(item) {
-  if (!item) return 'not available';
-  const s = item.state;
-  if (!s) return 'not available';
+function getScalarPathState(state) {
+  if (!state?.handler) return state;
+  return {
+    ...state,
+    subscribed: state.handler.subscribed,
+    pathKnown: state.handler.pathKnown,
+    hasDelta: state.hasDelta === true && state.handler.hasDelta === true,
+    isStale: state.isStale === true || state.handler.isStale === true,
+    ready: state.ready === true && state.handler.ready === true
+  };
+}
 
-  let subscribed, pathKnown;
-  if (s.handler !== undefined) {
-    subscribed = s.handler.subscribed;
-    pathKnown  = s.handler.pathKnown;
-  } else if (s.magnitude !== undefined || s.angle !== undefined) {
-    const mag = s.magnitude, ang = s.angle;
-    subscribed = (mag?.subscribed !== false) && (ang?.subscribed !== false);
-    pathKnown  = (mag?.pathKnown  !== false) && (ang?.pathKnown  !== false);
-  } else {
-    subscribed = s.subscribed;
-    pathKnown  = s.pathKnown;
+function getItemStatuses(item) {
+  const label = itemLabel(item);
+  const computed = computedItemIds.has(item.id);
+  const computedReady = item.state?.ready === true;
+  if (state.polarsById[item.id] === item) {
+    return [
+      {
+        label: `${label} magnitude`,
+        status: getPathStatus(item.state?.magnitude, Number.isFinite(item.magnitude), computed, computedReady)
+      },
+      {
+        label: `${label} angle`,
+        status: getPathStatus(
+          item.state?.angle,
+          Number.isFinite(item.angle),
+          computed || item.state?.angleFallbackActive === true,
+          computedReady
+        )
+      }
+    ];
   }
 
-  if (subscribed === false) return 'not subscribed to Signal K';
-  if (pathKnown  === false) return 'path not found in Signal K';
-  if (!s.hasDelta)          return 'waiting for first data';
-  if (s.isStale)            return 'data is stale';
-  return 'not available';
+  const pathState = getScalarPathState(item.state);
+  const hasValue = state.attitudesById[item.id] === item
+    ? Number.isFinite(item.value?.roll) || Number.isFinite(item.value?.pitch)
+    : Number.isFinite(item.value);
+  return [{ label, status: getPathStatus(pathState, hasValue, computed, computedReady) }];
 }
 
-function getAnyItem(id) {
-  return state.polarsById[id] || state.deltasById[id] || state.attitudesById[id] || null;
+function isAvailableStatus(status) {
+  return status.category === 'subscribed' || status.category === 'computed';
 }
 
-function renderInputWarnings(elId) {
+function renderWarnings(elId, items) {
   const el = document.getElementById(elId);
   if (!el) return;
   el.innerHTML = '';
-  const lines = [];
-  lifecycleWarnings.forEach(w => {
-    if (w && typeof w.message === 'string') lines.push(w.message);
-  });
-  if (lines.length === 0) return;
+  const problems = items.flatMap(item => getItemStatuses(item))
+    .filter(({ status }) => status.category === 'problem');
+  if (problems.length === 0) return;
   const h = document.createElement('h6');
   h.className = 'text-uppercase fw-bold text-muted border-bottom pb-1 mt-3 mb-1 small';
   h.textContent = 'Warnings';
   el.appendChild(h);
   const ul = document.createElement('ul');
   ul.className = 'list-unstyled text-danger small ps-3';
-  lines.forEach(line => {
+  problems.forEach(({ label, status }) => {
     const li = document.createElement('li');
-    li.textContent = line;
+    li.textContent = `"${label}" — ${status.reason}`;
     ul.appendChild(li);
   });
   el.appendChild(ul);
 }
 
-// ─── Config ───────────────────────────────────────────────────────────────────
+// ─── Config ──────────────────────────────────────────────────────────────────
 let config = null;
 
+// ─── HTTP helpers ─────────────────────────────────────────────────────────────
 async function apiGet(path) {
   let res;
   try {
@@ -204,7 +245,7 @@ async function apiPost(path, body) {
   return res.json();
 }
 
-function showMessage(html) {
+function showMessage(html, isLink = false) {
   _explicitMsg = html;
   _refreshMessage();
 }
@@ -230,15 +271,15 @@ function _refreshMessage() {
   }
 }
 
-// ─── Settings ─────────────────────────────────────────────────────────────────
+// ─── Settings ────────────────────────────────────────────────────────────────
 const paramMeta = {
-  estimateBoatSpeed:                 { label: 'Estimate boat speed',                       type: 'boolean' },
-  updateCorrectionTable:             { label: 'Update correction table',                   type: 'boolean' },
+  estimateBoatSpeed:     { label: 'Estimate boat speed',                  type: 'boolean' },
+  updateCorrectionTable: { label: 'Update correction table',              type: 'boolean' },
   suspendLearningOnNavigationState: { label: 'Suspend on navigation.state = motoring', type: 'boolean', description: 'Suspend learning when navigation.state is motoring. Anchored and moored always suspend learning when the path is available.' },
-  assumeCurrent:                     { label: 'Assume current during update',         type: 'boolean', description: 'Experimental, works best when currents are relatively stable.' },
-  sogFallback:                       { label: 'Groundspeed fallback',                 type: 'boolean', description: 'Output Groundspeed as Boatspeed when the paddlewheel sensor is malfunctioning or stalled.' },
-  stability:                         { label: 'Stability (1–20)',                     type: 'number', min: 1, max: 20, step: 1, default: 7, description: 'How quickly the correction table adapts to new observations. Higher values mean slower, more stable changes.' },
-  showStatistics:                    { label: 'Show statistics (σ)',                  type: 'boolean', description: 'Display standard deviation alongside smoothed values for debugging.' },
+  assumeCurrent:         { label: 'Assume current during update',         type: 'boolean', description: 'Experimental, works best when currents are relatively stable.' },
+  sogFallback:           { label: 'Groundspeed fallback',                 type: 'boolean', description: 'Output Groundspeed as Boatspeed when the paddlewheel sensor is malfunctioning or stalled.' },
+  stability:             { label: 'Stability (1–20)',                     type: 'number', min: 1, max: 20, step: 1, default: 7, description: 'How quickly the correction table adapts to new observations. Higher values mean slower, more stable changes.' },
+  showStatistics:        { label: 'Show statistics (σ)',                  type: 'boolean', description: 'Display standard deviation alongside smoothed values for debugging.' },
   smootherClass: {
     label: 'Smoother type', type: 'select',
     description: 'Smoothing applied to all sensor inputs for learning only.',
@@ -385,21 +426,28 @@ function renderSettingsPanel() {
   renderSectionToggles();
 }
 
-// ─── Formatting ───────────────────────────────────────────────────────────────
+// ─── Live data rendering ─────────────────────────────────────────────────────
+
 function formatPolarValue(p) {
   if (!p) return '—';
+  const statuses = getItemStatuses(p);
   const m = metaById[p.id];
   const speedC = buildConverter(m?.magnitude?.displayUnits) || DEFAULTS.speed;
   const angleC = buildConverter(m?.angle?.displayUnits)     || DEFAULTS.angle;
-  const spd = typeof p.magnitude === 'number' ? speedC.convert(p.magnitude).toFixed(speedC.decimals) : '—';
-  const ang = typeof p.angle    === 'number' ? angleC.convert(p.angle).toFixed(angleC.decimals)      : '—';
-  const sigma = (config?.showStatistics && p.id.endsWith('.smoothed') && typeof p.trace === 'number')
+  const spd = isAvailableStatus(statuses[0].status)
+    ? `${speedC.convert(p.magnitude).toFixed(speedC.decimals)} ${speedC.symbol}`
+    : statuses[0].status.reason;
+  const ang = isAvailableStatus(statuses[1].status)
+    ? `${angleC.convert(p.angle).toFixed(angleC.decimals)}${angleC.symbol}`
+    : statuses[1].status.reason;
+  const sigma = (isAvailableStatus(statuses[0].status) && config?.showStatistics && p.id.endsWith('.smoothed') && typeof p.trace === 'number')
     ? ` (σ=${speedC.convert(Math.sqrt(p.trace)).toFixed(speedC.decimals + 2)})` : '';
-  return `${spd} ${speedC.symbol} / ${ang}${angleC.symbol}${sigma}`;
+  return `${spd}${sigma} / ${ang}`;
 }
 
 function formatDeltaValue(d) {
-  if (!d || typeof d.value !== 'number') return '—';
+  const status = getItemStatuses(d)[0].status;
+  if (!isAvailableStatus(status)) return status.reason;
   const m = metaById[d.id];
   const uc = buildConverter(m?.displayUnits)
     || (m?.units === 'm/s' ? DEFAULTS.speed : DEFAULTS.angle);
@@ -409,14 +457,16 @@ function formatDeltaValue(d) {
 }
 
 function formatAttitudeValue(a) {
+  const status = getItemStatuses(a)[0].status;
+  if (!isAvailableStatus(status)) return status.reason;
   const v = (a && a.value) || {};
   const variance = a && a.variance;
   const m = metaById[a?.id];
   const angleC = buildConverter(m?.displayUnits) || DEFAULTS.angle;
   const roll  = typeof v.roll  === 'number' ? angleC.convert(v.roll).toFixed(angleC.decimals)  : '—';
   const showSigma = config?.showStatistics && a?.id?.endsWith('.smoothed');
-  const sigmaRoll  = (showSigma && variance && typeof variance.roll  === 'number') ? ` (σ=${angleC.convert(Math.sqrt(variance.roll)).toFixed(angleC.decimals + 2)})`  : '';
-  return `heel ${roll} ${angleC.symbol} ${sigmaRoll} `;
+  const sigmaRoll = (showSigma && variance && typeof variance.roll === 'number') ? ` (σ=${angleC.convert(Math.sqrt(variance.roll)).toFixed(angleC.decimals + 2)})` : '';
+  return `heel ${roll} ${angleC.symbol} ${sigmaRoll}`;
 }
 
 function itemLabel(item) {
@@ -429,7 +479,6 @@ function buildDataTable(rows) {
   const tbody = document.createElement('tbody');
   rows.forEach(row => {
     const tr = document.createElement('tr');
-    if (row.stale) tr.className = 'stale';
     const tdL = document.createElement('td'); tdL.textContent = row.label;
     const tdV = document.createElement('td'); tdV.textContent = row.value;
     tr.appendChild(tdL); tr.appendChild(tdV);
@@ -451,76 +500,131 @@ function renderGroupInto(elId, polars, deltas, attitudes) {
   if (!el) return;
   el.innerHTML = '';
   const rows = [
-    ...polars   .map(p => ({ label: itemLabel(p), value: formatPolarValue(p),    stale: isNotReady(p) })),
-    ...deltas   .map(d => ({ label: itemLabel(d), value: formatDeltaValue(d),    stale: isNotReady(d) })),
-    ...attitudes.map(a => ({ label: itemLabel(a), value: formatAttitudeValue(a), stale: isNotReady(a) }))
+    ...polars   .map(p => ({ label: itemLabel(p), value: formatPolarValue(p) })),
+    ...deltas   .map(d => ({ label: itemLabel(d), value: formatDeltaValue(d) })),
+    ...attitudes.map(a => ({ label: itemLabel(a), value: formatAttitudeValue(a) }))
   ];
   if (rows.length) el.appendChild(buildDataTable(rows));
 }
 
 function renderLiveSections() {
+  const activeTable = Object.values(state.tablesById)[0];
+  const isTwaMode = activeTable?.dimensionTwoMode === 'twa';
+
   const learningState = state.learningState || null;
   const inputPolars = filterById(state.polarsAll, ['groundSpeed']);
-  const inputDeltas = filterById(state.deltasAll, ['heading.angle', 'boatSpeed']);
-  const inputAttitudes = filterById(state.attitudesAll, ['attitude']);
-  const fallbackInputPolars = inputPolars.length ? inputPolars : filterById(state.polarsAll, ['groundSpeed.smoothed']);
-  const fallbackInputDeltas = inputDeltas.length ? inputDeltas : filterById(state.deltasAll, ['heading.smoothed', 'boatSpeed.smoothed']);
-  const fallbackInputAttitudes = inputAttitudes.length ? inputAttitudes : filterById(state.attitudesAll, ['attitude.smoothed']);
+  const inputDeltas = isTwaMode
+    ? filterById(state.deltasAll, ['heading.angle', 'boatSpeed', 'twa.angle'])
+    : filterById(state.deltasAll, ['heading.angle', 'boatSpeed']);
+  const inputAttitudes = isTwaMode ? [] : filterById(state.attitudesAll, ['attitude']);
 
-  renderGroupInto('inputs-values',
-    fallbackInputPolars,
-    fallbackInputDeltas,
-    fallbackInputAttitudes
+  const fallbackInputPolars = inputPolars.length ? inputPolars : filterById(state.polarsAll, ['groundSpeed.smoothed']);
+  const fallbackInputDeltas = inputDeltas.length ? inputDeltas : (
+    isTwaMode
+      ? filterById(state.deltasAll, ['heading.smoothed', 'boatSpeed.smoothed', 'twa'])
+      : filterById(state.deltasAll, ['heading.smoothed', 'boatSpeed.smoothed'])
   );
-  renderInputWarnings('inputs-warnings');
+  const fallbackInputAttitudes = isTwaMode ? [] : (inputAttitudes.length ? inputAttitudes : filterById(state.attitudesAll, ['attitude.smoothed']));
+  const displayedInputs = [...fallbackInputPolars, ...fallbackInputDeltas, ...fallbackInputAttitudes];
+
+  // Inputs section
+  renderGroupInto('inputs-values', fallbackInputPolars, fallbackInputDeltas, fallbackInputAttitudes);
+  renderWarnings('inputs-warnings', displayedInputs);
+
+  // Estimation section
+  const estimationInputs = isTwaMode
+    ? [
+        ...filterById(state.polarsAll, ['groundSpeed']),
+        ...filterById(state.deltasAll, ['heading.angle', 'boatSpeed', 'twa.angle'])
+      ]
+    : [
+        ...filterById(state.polarsAll, ['groundSpeed']),
+        ...filterById(state.deltasAll, ['heading.angle', 'boatSpeed']),
+        ...filterById(state.attitudesAll, ['attitude'])
+      ];
 
   renderGroupInto('estimation-inputs',
-    filterById(state.polarsAll,    ['groundSpeed']),
-    filterById(state.deltasAll,    ['heading.angle', 'boatSpeed']),
-    filterById(state.attitudesAll, ['attitude'])
-  );
-  renderGroupInto('estimation-intermediates',
-    filterById(state.polarsAll, ['boatSpeedRefGround', 'speedCorrection', 'residual', 'residual.smoothed']),
-    [], []
-  );
-  renderGroupInto('estimation-outputs',
-    filterById(state.polarsAll, ['correctedBoatSpeed', 'current.smoothed']),
-    [], []
+    estimationInputs.filter(item => state.polarsById[item.id] === item),
+    estimationInputs.filter(item => state.deltasById[item.id] === item),
+    estimationInputs.filter(item => state.attitudesById[item.id] === item)
   );
 
+  const estimationIntermediates = filterById(state.polarsAll, ['boatSpeedRefGround', 'speedCorrection', 'residual', 'residual.smoothed']);
+  renderGroupInto('estimation-intermediates', estimationIntermediates, [], []);
+  const estimationOutputs = filterById(state.polarsAll, ['correctedBoatSpeed', 'current.smoothed']);
+  renderGroupInto('estimation-outputs', estimationOutputs, [], []);
+  renderWarnings('estimation-warnings', [...estimationInputs, ...estimationIntermediates, ...estimationOutputs]);
+
+  // Learning section
   const learningCurrentPolars = (config && config.assumeCurrent)
     ? filterById(state.polarsAll, ['current.smoothed'])
     : [];
-  renderGroupInto('learning-inputs',
-    [...filterById(state.polarsAll, ['groundSpeed.smoothed']), ...learningCurrentPolars],
-    filterById(state.deltasAll,    ['heading.smoothed', 'boatSpeed.smoothed']),
-    filterById(state.attitudesAll, ['attitude.smoothed'])
-  );
+  const learningPolars = [...filterById(state.polarsAll, ['groundSpeed.smoothed']), ...learningCurrentPolars];
+  const learningDeltas = isTwaMode
+    ? filterById(state.deltasAll, ['heading.smoothed', 'boatSpeed.smoothed', 'twa'])
+    : filterById(state.deltasAll, ['heading.smoothed', 'boatSpeed.smoothed']);
+  const learningAttitudes = isTwaMode ? [] : filterById(state.attitudesAll, ['attitude.smoothed']);
 
+  renderGroupInto('learning-inputs', learningPolars, learningDeltas, learningAttitudes);
+  const learningWarnings = document.getElementById('learning-warnings');
+  renderWarnings('learning-warnings', [...learningPolars, ...learningDeltas, ...learningAttitudes]);
+  if (learningWarnings) {
+    const navState = learningState?.navigationState;
+    if (navState?.enabled && navState.pathKnown === false) {
+      const ul = document.createElement('ul');
+      ul.className = 'list-unstyled small ps-3';
+      const li = document.createElement('li');
+      li.textContent = 'navigation.state is not available; navigation-state learning gate is inactive.';
+      ul.appendChild(li);
+      learningWarnings.appendChild(ul);
+    }
+  }
+
+  // Learning status section
   const statusTbody = document.querySelector('#learning-status-table tbody');
   if (statusTbody) {
-    const learningTextMap = { off: 'Off', stabilizing: 'Stabilising', active: 'Active', suspended: 'Suspended' };
-    const observationTextMap = { accepted: 'Accepted', rejected: 'Rejected', invalid: 'Invalid', skipped: 'Skipped' };
+    const learningTextMap = {
+      off: 'Off',
+      stabilizing: 'Stabilising',
+      active: 'Active',
+      suspended: 'Suspended',
+    };
+    const observationTextMap = {
+      accepted: 'Accepted',
+      rejected: 'Rejected',
+      invalid: 'Invalid',
+      skipped: 'Skipped',
+    };
     const reasonTextMap = {
-      manual: 'Manual toggle off', startup: 'Startup stabilising window',
+      manual: 'Manual toggle off',
+      startup: 'Startup stabilising window',
       observation_reset: 'Recent rejected or invalid observation',
-      nav_state_change: 'navigation.state changed', nav_state: 'Blocked by navigation.state',
-      cog_override: 'Blocked by COG override', accepted: 'Observation recorded',
-      estimator_outlier: 'Estimator rejected observation', missing_input: 'Required learning input unavailable',
-      missing_current_when_required: 'Current estimate unavailable', learning_off: 'Learning is off',
-      stabilizing: 'Stabilising window active', nav_state_blocked: 'Learning blocked by navigation.state',
-      cog_override_active: 'Learning blocked by COG override', stw_below_threshold: 'Below minimum STW for learning',
+      nav_state_change: 'navigation.state changed',
+      nav_state: 'Blocked by navigation.state',
+      cog_override: 'Blocked by COG override',
+      accepted: 'Observation recorded',
+      estimator_outlier: 'Estimator rejected observation',
+      missing_input: 'Required learning input unavailable',
+      missing_current_when_required: 'Current estimate unavailable',
+      learning_off: 'Learning is off',
+      stabilizing: 'Stabilising window active',
+      nav_state_blocked: 'Learning blocked by navigation.state',
+      cog_override_active: 'Learning blocked by COG override',
+      stw_below_threshold: 'Below minimum STW for learning',
       sog_below_threshold: 'Below minimum SOG for learning',
     };
-    const learningText = learningTextMap[learningState?.state] || '—';
-    const obsText = observationTextMap[learningState?.observationState] || '—';
-    const reason = reasonTextMap[learningState?.observationReason] || reasonTextMap[learningState?.reason] || '—';
+    const learningText = learningTextMap[learningState?.state] || '\u2014';
+    const obsText = observationTextMap[learningState?.observationState] || '\u2014';
+    const reason = reasonTextMap[learningState?.observationReason]
+      || reasonTextMap[learningState?.reason]
+      || '\u2014';
     statusTbody.innerHTML =
       `<tr><td class="text-muted small">Learning</td><td class="small">${learningText}</td></tr>` +
       `<tr><td class="text-muted small">Observation</td><td class="small">${obsText}</td></tr>` +
       `<tr><td class="text-muted small">Reason</td><td class="small">${reason}</td></tr>`;
   }
 
+  // Correction table
   const tableEl = document.getElementById('table-container');
   if (tableEl) {
     tableEl.innerHTML = '';
@@ -557,12 +661,10 @@ async function tick() {
     lastTickOk = false;
     state.learningState = null;
   }
-
   const statusData = await fetch(`${API_BASE}/api/status`, { credentials: 'same-origin' })
     .then(r => r.ok ? r.json() : null)
     .catch(() => null);
   _pluginStatus = statusData?.status ?? '';
-  lifecycleWarnings = Array.isArray(statusData?.lifecycleWarnings) ? statusData.lifecycleWarnings : [];
   _refreshMessage();
 }
 
@@ -571,7 +673,7 @@ function startUpdates() {
   updateTimer = setInterval(tick, 1000);
 }
 
-// ─── Vanilla Modal Helpers ────────────────────────────────────────────────────
+// ─── Vanilla modal helpers ────────────────────────────────────────────────────
 function showModal(id) {
   const el = document.getElementById(id);
   if (!el) return;
@@ -595,7 +697,7 @@ function closeModal(id) {
   if (bd) bd.remove();
 }
 
-// ─── Correction Table Manager ─────────────────────────────────────────────────
+// ─── Correction table manager ─────────────────────────────────────────────────
 function setTableName(name) {
   const el = document.getElementById('active-table-name');
   if (el) el.textContent = name ? `(${name})` : '';
@@ -618,35 +720,141 @@ function initTableManager() {
     el.addEventListener('click', e => { if (e.target === el) closeModal(id); });
   });
 
+  // Dimension 2 selector in Create dialog
+  const createModeSel = document.getElementById('create-dim2-mode');
+  if (createModeSel) {
+    createModeSel.addEventListener('change', () => {
+      const isTwa = createModeSel.value === 'twa';
+      document.querySelectorAll('.create-heel-row').forEach(row => {
+        row.style.display = isTwa ? 'none' : '';
+      });
+      const twaInfo = document.getElementById('create-twa-info-row');
+      if (twaInfo) twaInfo.style.display = isTwa ? '' : 'none';
+    });
+  }
+
+  // ── New ──
   document.getElementById('btn-tbl-new')?.addEventListener('click', () => {
     modalStatus('create', '');
+    if (createModeSel) {
+      createModeSel.value = 'heel';
+      createModeSel.dispatchEvent(new Event('change'));
+    }
     showModal('modal-create');
   });
 
-  document.getElementById('create-mode')?.addEventListener('change', (e) => {
-    const isHeel = e.target.value === 'heel';
-    document.getElementById('row-create-maxDim2').style.display = isHeel ? '' : 'none';
-    document.getElementById('row-create-dim2Step').style.display = isHeel ? '' : 'none';
+  // ── Load ──
+  document.getElementById('btn-tbl-load')?.addEventListener('click', async () => {
+    const listEl = document.getElementById('table-list');
+    const confirmBtn = document.getElementById('btn-load-confirm');
+    if (listEl) listEl.innerHTML = '<li class="list-group-item text-muted small">Loading…</li>';
+    if (confirmBtn) { confirmBtn.disabled = true; confirmBtn.onclick = null; }
+    modalStatus('load', '');
+    showModal('modal-load');
+    let selectedName = null;
+    const tables = await apiGet('/api/tables');
+    if (!listEl) return;
+    listEl.innerHTML = '';
+    if (!tables || tables.length === 0) {
+      listEl.innerHTML = '<li class="list-group-item text-muted small">No saved tables found.</li>';
+      return;
+    }
+    tables.forEach(t => {
+      const li = document.createElement('li');
+      li.className = 'list-group-item list-group-item-action d-flex justify-content-between align-items-center'
+        + (t.active ? ' active' : '');
+      const span = document.createElement('span');
+      span.textContent = t.name;
+      li.appendChild(span);
+
+      const badges = document.createElement('div');
+      badges.className = 'd-flex gap-1';
+      if (t.dimensionTwoMode === 'twa') {
+        const twaBadge = document.createElement('span');
+        twaBadge.className = 'badge bg-info text-dark';
+        twaBadge.textContent = 'twa';
+        badges.appendChild(twaBadge);
+      }
+      if (t.active) {
+        const badge = document.createElement('span');
+        badge.className = 'badge bg-secondary';
+        badge.textContent = 'active';
+        badges.appendChild(badge);
+      }
+      li.appendChild(badges);
+
+      li.addEventListener('click', () => {
+        listEl.querySelectorAll('li').forEach(l => l.classList.remove('active'));
+        li.classList.add('active');
+        selectedName = t.name;
+        if (confirmBtn) confirmBtn.disabled = false;
+      });
+      listEl.appendChild(li);
+    });
+    if (confirmBtn) {
+      confirmBtn.onclick = async () => {
+        if (!selectedName) return;
+        modalStatus('load', '');
+        try {
+          const r = await apiPost('/api/tables/load', { name: selectedName });
+          setTableName(r.name);
+          if (config) config.tableName = r.name;
+          closeModal('modal-load');
+          await tick();
+        } catch (e) { modalStatus('load', e.message); }
+      };
+    }
   });
 
+  // ── Copy ──
+  document.getElementById('btn-tbl-copy')?.addEventListener('click', () => {
+    modalStatus('copy', '');
+    showModal('modal-copy');
+  });
+
+  // ── Resize ──
+  document.getElementById('btn-tbl-resize')?.addEventListener('click', () => {
+    modalStatus('resize', '');
+    const t = Object.values(state.tablesById)[0];
+    const isTwa = t?.dimensionTwoMode === 'twa';
+    document.querySelectorAll('.resize-heel-row').forEach(row => {
+      row.style.display = isTwa ? 'none' : '';
+    });
+    const twaInfo = document.getElementById('resize-twa-info-row');
+    if (twaInfo) twaInfo.style.display = isTwa ? '' : 'none';
+
+    if (t && t.row) {
+      const speedC = unitConverters.speed || DEFAULTS.speed;
+      const angleC = unitConverters.angle || DEFAULTS.angle;
+      const setVal = (id, v, dec) => { const el = document.getElementById(id); if (el) el.value = +v.toFixed(dec); };
+      setVal('resize-maxSpeed',  speedC.convert(t.row.max),  Math.max(speedC.decimals, 1));
+      setVal('resize-speedStep', speedC.convert(t.row.step), Math.max(speedC.decimals, 1));
+      if (!isTwa && t.col) {
+        setVal('resize-maxHeel',   angleC.convert(t.col.max),  Math.max(angleC.decimals, 0));
+        setVal('resize-heelStep',  angleC.convert(t.col.step), Math.max(angleC.decimals, 0));
+      }
+    }
+    showModal('modal-resize');
+  });
+
+  // ── Create confirm ──
   document.getElementById('btn-create-confirm')?.addEventListener('click', async () => {
     modalStatus('create', '');
-    const mode = document.getElementById('create-mode')?.value || 'twa';
     const speedC = unitConverters.speed || DEFAULTS.speed;
     const angleC = unitConverters.angle || DEFAULTS.angle;
     const invertSpeed = speedC.invert || DEFAULTS.speed.invert;
     const invertAngle = angleC.invert || DEFAULTS.angle.invert;
+    const mode = createModeSel ? createModeSel.value : 'heel';
 
     const body = {
-      name: (document.getElementById('create-name')?.value || '').trim(),
+      name:             (document.getElementById('create-name')?.value || '').trim(),
       dimensionTwoMode: mode,
-      maxSpeed: invertSpeed(Number(document.getElementById('create-maxSpeed')?.value)),
-      speedStep: invertSpeed(Number(document.getElementById('create-speedStep')?.value)),
+      maxSpeed:         invertSpeed(Number(document.getElementById('create-maxSpeed')?.value)),
+      speedStep:        invertSpeed(Number(document.getElementById('create-speedStep')?.value)),
     };
-
     if (mode === 'heel') {
-      body.maxDim2 = invertAngle(Number(document.getElementById('create-maxHeel')?.value));
-      body.dim2Step = invertAngle(Number(document.getElementById('create-heelStep')?.value));
+      body.maxHeel = invertAngle(Number(document.getElementById('create-maxHeel')?.value));
+      body.heelStep = invertAngle(Number(document.getElementById('create-heelStep')?.value));
     }
 
     if (!body.name) { modalStatus('create', 'Name is required.'); return; }
@@ -657,6 +865,51 @@ function initTableManager() {
       closeModal('modal-create');
       await tick();
     } catch (e) { modalStatus('create', e.message); }
+  });
+
+  // ── Copy confirm ──
+  document.getElementById('btn-copy-confirm')?.addEventListener('click', async () => {
+    modalStatus('copy', '');
+    const newName = (document.getElementById('copy-name')?.value || '').trim();
+    if (!newName) { modalStatus('copy', 'New name is required.'); return; }
+    try {
+      const r = await apiPost('/api/tables/copy', { newName });
+      setTableName(r.name);
+      if (config) config.tableName = r.name;
+      closeModal('modal-copy');
+      await tick();
+    } catch (e) { modalStatus('copy', e.message); }
+  });
+
+  // ── Resize confirm ──
+  document.getElementById('btn-resize-confirm')?.addEventListener('click', async () => {
+    modalStatus('resize', '');
+    const t = Object.values(state.tablesById)[0];
+    const isTwa = t?.dimensionTwoMode === 'twa';
+
+    const speedC = unitConverters.speed || DEFAULTS.speed;
+    const angleC = unitConverters.angle || DEFAULTS.angle;
+    const invertSpeed = speedC.invert || DEFAULTS.speed.invert;
+    const invertAngle = angleC.invert || DEFAULTS.angle.invert;
+
+    const body = {
+      maxSpeed:  invertSpeed(Number(document.getElementById('resize-maxSpeed')?.value)),
+      speedStep: invertSpeed(Number(document.getElementById('resize-speedStep')?.value)),
+    };
+    if (!isTwa) {
+      body.maxHeel = invertAngle(Number(document.getElementById('resize-maxHeel')?.value));
+      body.heelStep = invertAngle(Number(document.getElementById('resize-heelStep')?.value));
+    }
+
+    if (!Object.values(body).every(v => Number.isFinite(v) && v > 0)) {
+      modalStatus('resize', 'All dimensions must be positive numbers.');
+      return;
+    }
+    try {
+      await apiPost('/api/tables/resize', body);
+      closeModal('modal-resize');
+      await tick();
+    } catch (e) { modalStatus('resize', e.message); }
   });
 }
 

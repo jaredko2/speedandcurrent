@@ -1,0 +1,6 @@
+{
+  "name": "Speed and Current",
+  "description": "Marine navigation sensor fusion webapp and Signal K plugin for real-time boat speed estimation, current calculation, leeway estimation, and 2D calibration tables.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
