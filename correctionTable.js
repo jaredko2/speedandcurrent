@@ -214,64 +214,142 @@ class CorrectionTable extends Table2D {
   }
 
   getCorrection(speed, heelOrTwa) {
-    if (this.dimensionTwoMode === 'twa') {
-      const bins = Array.isArray(this.col?.bins) ? this.col.bins : DEFAULT_TWA_BINS;
-      const candidates = [];
-      const stepR = (this.row && Number.isFinite(this.row.step)) ? this.row.step : 0.5144;
-      const minR = (this.row && Number.isFinite(this.row.min)) ? this.row.min : 0;
-      const avgBinStepRad = (bins[bins.length - 1] - bins[0]) / (bins.length - 1);
+    const isTwa = this.dimensionTwoMode === 'twa';
+    const bins = isTwa && Array.isArray(this.col?.bins) ? this.col.bins : (isTwa ? DEFAULT_TWA_BINS : null);
+    const stepR = (this.row && Number.isFinite(this.row.step)) ? this.row.step : 0.5144;
+    const minR = (this.row && Number.isFinite(this.row.min)) ? this.row.min : 0;
+    const nRows = this.table.length;
 
-      this.table.forEach((rowCells, rIdx) => {
-        const rSpeed = minR + rIdx * stepR;
-        const normDistR = (speed - rSpeed) / stepR;
+    // Helper: determine sailing sector from TWA (rad) or Heel (rad)
+    // Sectors: 'upwind', 'reaching', 'downwind'
+    const getSector = (dim2) => {
+      if (isTwa) {
+        const absDeg = Math.abs(dim2 * (180 / Math.PI));
+        if (absDeg <= 60) return 'upwind';
+        if (absDeg >= 120) return 'downwind';
+        return 'reaching';
+      } else {
+        const absDeg = Math.abs(dim2 * (180 / Math.PI));
+        const maxDeg = Math.abs((this.col?.max ?? 0.5585) * (180 / Math.PI)) || 32;
+        if (absDeg < Math.max(3, maxDeg * 0.18)) return 'downwind';
+        if (absDeg >= maxDeg * 0.52) return 'upwind';
+        return 'reaching';
+      }
+    };
 
-        rowCells.forEach((cell, cIdx) => {
-          const binRad = bins[cIdx] ?? 0;
-          const normDistC = normalizeAngleDiff(heelOrTwa, binRad) / avgBinStepRad;
-          const dist = Math.sqrt(normDistR ** 2 + normDistC ** 2);
-          candidates.push({ cell, dist });
-        });
+    const currentSector = getSector(heelOrTwa);
+    const avgBinStepRad = isTwa
+      ? (bins[bins.length - 1] - bins[0]) / (bins.length - 1)
+      : ((this.col && Number.isFinite(this.col.step)) ? this.col.step : 0.1396);
+
+    // Compute all candidates with normalized coordinates
+    const allCandidates = [];
+    this.table.forEach((rowCells, rIdx) => {
+      const rSpeed = minR + rIdx * stepR;
+      const normDistR = (speed - rSpeed) / stepR;
+
+      rowCells.forEach((cell, cIdx) => {
+        let binVal = 0;
+        let normDistC = 0;
+        if (isTwa) {
+          binVal = bins[cIdx] ?? 0;
+          normDistC = normalizeAngleDiff(heelOrTwa, binVal) / avgBinStepRad;
+        } else {
+          binVal = (this.col?.min ?? -0.5585) + cIdx * ((this.col?.step) ?? 0.1396);
+          normDistC = Math.abs(heelOrTwa - binVal) / avgBinStepRad;
+        }
+        const cellSector = getSector(binVal);
+        const dist = Math.sqrt(normDistR ** 2 + normDistC ** 2);
+        allCandidates.push({ cell, dist, normDistR, normDistC, cellSector, rIdx, cIdx });
       });
+    });
 
-      candidates.sort((a, b) => a.dist - b.dist);
-      this.neighbours = candidates.slice(0, 5);
-    } else {
-      this.neighbours = this.findClosest(speed, heelOrTwa, 5);
+    // 1. Maintain this.neighbours for telemetry and UI highlighting
+    allCandidates.sort((a, b) => a.dist - b.dist);
+    this.neighbours = allCandidates.slice(0, 5);
+
+    // 2. Compute Forward / Paddlewheel correction (x):
+    // Paddlewheel response is correlated across speeds, but flow regimes differ across points of sail.
+    // Prefer cells from the same sailing sector (or near sector) to avoid upwind cross-flow biasing reaching/downwind.
+    let xCandidates = allCandidates.filter(c => c.cell.N > 0 && c.cellSector === currentSector);
+    if (xCandidates.length === 0) {
+      // If no cells learned in this exact sector yet, fall back to nearest learned cells across speed
+      xCandidates = allCandidates.filter(c => c.cell.N > 0);
     }
-
-    if (this.neighbours.length === 0) return { correction: { x: 0, y: 0 }, variance: null };
+    xCandidates.sort((a, b) => a.dist - b.dist);
+    const xNeighbors = xCandidates.slice(0, 4);
 
     let x = 0;
-    let y = 0;
     let varX = 0;
+    let totalWeightX = 0;
+    for (const n of xNeighbors) {
+      // Along speed axis, paddlewheel calibration correlates smoothly
+      const weight = 1 / (Math.abs(n.normDistR) + 0.3 * Math.abs(n.normDistC) + 1e-4);
+      x += n.cell.x * weight;
+      varX += (n.cell.covariance?.[0]?.[0] ?? 0.01) * (weight ** 2);
+      totalWeightX += weight;
+    }
+    if (totalWeightX > 0) {
+      x /= totalWeightX;
+      varX /= (totalWeightX * totalWeightX);
+    }
+
+    // 3. Compute Lateral / Leeway correction (y):
+    // Physics constraint:
+    // - Downwind: Leeway is strictly 0.0°. Upwind leeway must NEVER bleed into downwind.
+    // - Reaching: Leeway is minimal. Only consider cells in reaching or downwind, never upwind.
+    // - Upwind: Leeway comes strictly from upwind cells.
+    let y = 0;
     let varY = 0;
-    let totalWeight = 0;
+    let totalWeightY = 0;
+
+    if (currentSector === 'downwind') {
+      // Hard physical clamp: Zero aerodynamic side force when running downwind
+      y = 0;
+      varY = 1e-6;
+    } else {
+      let yCandidates = allCandidates.filter(c => c.cell.N > 0 && c.cellSector === currentSector);
+      if (yCandidates.length === 0 && currentSector === 'reaching') {
+        // If reaching has no data yet, do not pull from upwind; leeway remains zero/near-zero
+        y = 0;
+        varY = 1e-6;
+      } else {
+        yCandidates.sort((a, b) => a.dist - b.dist);
+        const yNeighbors = yCandidates.slice(0, 3);
+        for (const n of yNeighbors) {
+          const weight = 1 / (n.dist + 1e-4);
+          y += n.cell.y * weight;
+          varY += (n.cell.covariance?.[1]?.[1] ?? 0.01) * (weight ** 2);
+          totalWeightY += weight;
+        }
+        if (totalWeightY > 0) {
+          y /= totalWeightY;
+          varY /= (totalWeightY * totalWeightY);
+        }
+      }
+    }
+
+    // 4. Update normWeights for the UI display
+    let totalUiWeight = 0;
     for (const neighbour of this.neighbours) {
-      const { cell: correction, dist } = neighbour;
-      if (correction.N > 0) {
-        const weight = 1 / (dist + 1e-6); 
-        neighbour.normWeight = weight;
-        x += correction.x * weight;
-        y += correction.y * weight;
-        varX += correction.covariance[0][0] * weight ** 2;
-        varY += correction.covariance[1][1] * weight ** 2;
-        totalWeight += weight;
+      if (neighbour.cell.N > 0) {
+        const w = 1 / (neighbour.dist + 1e-6);
+        neighbour.normWeight = w;
+        totalUiWeight += w;
+      } else {
+        neighbour.normWeight = 0;
       }
     }
-    if (totalWeight > 0) {
+    if (totalUiWeight > 0) {
       for (const neighbour of this.neighbours) {
-        neighbour.normWeight /= totalWeight;
+        neighbour.normWeight /= totalUiWeight;
       }
     }
+    this.totalWeight = totalUiWeight;
 
-    if (totalWeight === 0) return { correction: { x: 0, y: 0 }, variance: { x: 0, y: 0 } };
-
-    const tw2 = totalWeight * totalWeight;
-    x /= totalWeight;
-    y /= totalWeight;
-    varX /= tw2;
-    varY /= tw2;
-    this.totalWeight = totalWeight;
+    if (totalWeightX === 0 && totalWeightY === 0 && currentSector !== 'downwind') {
+      return { correction: { x: 0, y: 0 }, variance: { x: 0, y: 0 } };
+    }
 
     return { correction: { x, y }, variance: { x: varX, y: varY } };
   }

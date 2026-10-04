@@ -786,4 +786,47 @@ describe('truewindangle (TWA) correction table', () => {
       assert.deepStrictEqual(angles, ['>120°', '60°–120°', '<60°', '<60°', '60°–120°', '>120°']);
     });
   });
+
+  describe('decoupled hydrodynamic interpolation in CorrectionTable', () => {
+    const { CorrectionTable } = require('../correctionTable.js');
+
+    it('ensures downwind leeway is clamped to 0.0 and does not inherit upwind leeway', () => {
+      // Table with 6 TWA columns: [-145, -90, -40, 40, 90, 145] deg
+      const table = CorrectionTable.createDefault('test-cat', 'twa', 6);
+      
+      // Seed upwind cell with high leeway (y = 0.5 m/s)
+      const upwindCell = table.getCell(3.0, 40 * Math.PI / 180);
+      upwindCell.filterState = {
+        mean: [[0.2], [0.5]],
+        covariance: [[0.01, 0], [0, 0.01]],
+        index: 5
+      };
+
+      // Query downwind (TWA = 145 deg)
+      const downwindRes = table.getCorrection(3.0, 145 * Math.PI / 180);
+      assert.strictEqual(downwindRes.correction.y, 0, 'Downwind lateral leeway must be strictly 0');
+
+      // Query reaching (TWA = 90 deg) when reaching has no observations
+      const reachRes = table.getCorrection(3.0, 90 * Math.PI / 180);
+      assert.strictEqual(reachRes.correction.y, 0, 'Reaching lateral leeway must not pull from upwind');
+    });
+
+    it('interpolates paddlewheel forward correction along speed smoothly within matching regime', () => {
+      const table = CorrectionTable.createDefault('test-cat', 'twa', 6);
+
+      // Seed 2.5 m/s upwind cell with +0.3 m/s paddlewheel error
+      const cell5kn = table.getCell(2.5, 40 * Math.PI / 180);
+      cell5kn.filterState = {
+        mean: [[0.3], [0.2]],
+        covariance: [[0.01, 0], [0, 0.01]],
+        index: 5
+      };
+
+      // Query at 3.0 m/s upwind: should interpolate paddlewheel correction (x > 0)
+      const queryRes = table.getCorrection(3.0, 40 * Math.PI / 180);
+      assert.ok(queryRes.correction.x > 0, 'Forward speed error should interpolate across speed');
+      assert.ok(queryRes.correction.y > 0, 'Upwind leeway should be present when querying upwind');
+    });
+  });
 });
+
