@@ -160,6 +160,7 @@ module.exports = function (app) {
     suspendLearningOnNavigationState: false,
     tableName: 'correctionTable',
     configVersion: 2,
+    currentDampingWindow: 120,
     smootherClass: 'MovingAverageSmoother',
     smootherTau: 3,
     smootherTimeSpan: 5,
@@ -635,7 +636,8 @@ module.exports = function (app) {
     rawCurrent.configureAngle("environment.current.setTrue");
     rawCurrent.setMeta({ displayName: "Current", plane: "Ground" });
     rawCurrent.setAngleRange('0to2pi');
-    smoothedCurrent = new PolarSmoother(rawCurrent, KalmanSmoother, { processVariance: 0.000001, measurementVariance: 0.01 });
+    const currentDampingTau = Math.max(1, Number(options.currentDampingWindow) || 120);
+    smoothedCurrent = new PolarSmoother(rawCurrent, ExponentialSmoother, { tau: currentDampingTau, timeSpan: currentDampingTau });
     smoothedCurrent.setAngleRange('0to2pi');
     rawCurrent.setVectorValue({ x: 0, y: 0 });
     smoothedCurrent.xSmoother.reset(0, 0.00000001);
@@ -1040,6 +1042,12 @@ module.exports = function (app) {
         if (s) { s.setSmootherClass(SC); s.setSmootherOptions(so); }
       }
       if (smoothedAttitude) { smoothedAttitude.setSmootherClass(SC); smoothedAttitude.setSmootherOptions(so); }
+    }
+
+    if (changedKeys.includes('currentDampingWindow') && smoothedCurrent) {
+      const tau = Math.max(1, Number(options.currentDampingWindow) || 120);
+      smoothedCurrent.setSmootherClass(ExponentialSmoother);
+      smoothedCurrent.setSmootherOptions({ tau, timeSpan: tau });
     }
     saveOptions();
   }

@@ -244,6 +244,7 @@ describe('registerWithRouter', () => {
       assert.ok(!('minSogForLearning' in response), 'obsolete minSogForLearning should not be exposed');
       assert.ok('smootherClass'         in response, 'missing smootherClass');
       assert.ok('stability'             in response, 'missing stability');
+      assert.strictEqual(response.currentDampingWindow, 120, 'currentDampingWindow should default to 120');
     } finally {
       cleanup();
     }

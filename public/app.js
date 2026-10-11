@@ -280,6 +280,11 @@ const paramMeta = {
   sogFallback:           { label: 'Groundspeed fallback',                 type: 'boolean', description: 'Output Groundspeed as Boatspeed when the paddlewheel sensor is malfunctioning or stalled.' },
   stability:             { label: 'Stability (1–20)',                     type: 'number', min: 1, max: 20, step: 1, default: 7, description: 'How quickly the correction table adapts to new observations. Higher values mean slower, more stable changes.' },
   showStatistics:        { label: 'Show statistics (σ)',                  type: 'boolean', description: 'Display standard deviation alongside smoothed values for debugging.' },
+  currentDampingWindow: {
+    label: 'Current damping (τ)', type: 'number', unit: 's',
+    min: 10, max: 600, step: 5, default: 120,
+    description: 'Time constant in seconds for damping calculated current (set & drift).'
+  },
   smootherClass: {
     label: 'Smoother type', type: 'select',
     description: 'Smoothing applied to all sensor inputs for learning only.',
@@ -306,7 +311,7 @@ const paramMeta = {
   },
 };
 
-const ESTIMATION_SETTING_KEYS = ['sogFallback'];
+const ESTIMATION_SETTING_KEYS = ['sogFallback', 'currentDampingWindow'];
 const LEARNING_SETTING_KEYS   = ['stability', 'suspendLearningOnNavigationState', 'assumeCurrent', 'showStatistics'];
 const SMOOTHER_SETTING_KEYS   = [
   'smootherClass',
